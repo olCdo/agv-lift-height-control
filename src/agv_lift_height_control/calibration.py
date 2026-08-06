@@ -171,15 +171,96 @@ def _validated_sample(sample: HeightSample) -> float:
     return _finite_number("height_mm", sample.height_mm, minimum=0)
 
 
+def _session_timeout(name: str, value: object, maximum: float) -> float:
+    result = _finite_number(name, value, minimum=0)
+    if result <= 0 or result > maximum:
+        raise CalibrationError(f"{name} 必须大于零且不得超过 {maximum}")
+    return result
+
+
+def _validate_session_inputs(
+    *,
+    now: object,
+    sample: object,
+    feedback: object,
+    last_now: float | None,
+    sensor_timeout_s: float,
+    feedback_timeout_s: float,
+    absolute_max_height_mm: float,
+) -> tuple[float, float, PumpFeedback]:
+    """统一校验标定步进输入；调用方捕获异常后锁失败并返回全零。"""
+    timestamp = _finite_number("now", now, minimum=0)
+    if last_now is not None and timestamp < last_now:
+        raise CalibrationError("标定时钟不得回退")
+    if (
+        not isinstance(sample, HeightSample)
+        or type(sample.valid) is not bool
+        or not sample.valid
+        or sample.height_mm is None
+    ):
+        raise CalibrationError("标定需要有效高度样本")
+    sample_timestamp = _finite_number(
+        "sample.timestamp", sample.timestamp, minimum=0
+    )
+    sample_age = timestamp - sample_timestamp
+    if sample_age < 0 or sample_age - sensor_timeout_s > 1e-12:
+        raise CalibrationError("标定高度样本已超时或来自未来")
+    if type(sample.raw_count) is not int or not 0 <= sample.raw_count <= 0xFFFFFFFF:
+        raise CalibrationError("标定高度 raw_count 不合理")
+    height = _finite_number("height_mm", sample.height_mm, minimum=0)
+    if height > absolute_max_height_mm:
+        raise CalibrationError("标定高度超过绝对上限")
+
+    if not isinstance(feedback, PumpFeedback):
+        raise CalibrationError("标定需要 CAN 泵反馈")
+    feedback_timestamp = _finite_number(
+        "feedback.timestamp", feedback.timestamp, minimum=0
+    )
+    feedback_age = timestamp - feedback_timestamp
+    if feedback_age < 0 or feedback_age - feedback_timeout_s > 1e-12:
+        raise CalibrationError("标定 CAN 泵反馈已超时或来自未来")
+    if type(feedback.fault_code) is not int or feedback.fault_code != 0:
+        raise CalibrationError(f"标定 CAN 泵反馈故障码 {feedback.fault_code}")
+    if type(feedback.current_raw) is not int or not 0 <= feedback.current_raw <= 65535:
+        raise CalibrationError("标定 CAN 泵电流不合理")
+    if (
+        type(feedback.lower_current_raw) is not int
+        or not 0 <= feedback.lower_current_raw <= 255
+    ):
+        raise CalibrationError("标定下降电流不合理")
+    return timestamp, height, feedback
+
+
 class LiftCalibrationSession:
     """确定性起升标定会话；一次调用最多推进一个相位边界。"""
 
-    def __init__(self, *, direction_tolerance_mm: float = 0.5) -> None:
+    def __init__(
+        self,
+        *,
+        direction_tolerance_mm: float = 0.5,
+        sensor_timeout_s: float = 0.1,
+        feedback_timeout_s: float = 0.15,
+        absolute_max_height_mm: float = 2900.0,
+    ) -> None:
         self._direction_tolerance_mm = _finite_number(
             "direction_tolerance_mm", direction_tolerance_mm, minimum=0
         )
         self._index = 0
         self._trials: list[LiftTrial] = []
+        self._sensor_timeout_s = _session_timeout(
+            "sensor_timeout_s", sensor_timeout_s, 0.1
+        )
+        self._feedback_timeout_s = _session_timeout(
+            "feedback_timeout_s", feedback_timeout_s, 0.15
+        )
+        self._absolute_max_height_mm = _finite_number(
+            "absolute_max_height_mm", absolute_max_height_mm, minimum=0.001
+        )
+        if self._absolute_max_height_mm > 2900.0:
+            raise CalibrationError("absolute_max_height_mm 不得超过 2900")
+        self.failed = False
+        self.fault_reason: str | None = None
+        self._last_now: float | None = None
         self._active_started_at: float | None = None
         self._start_height = 0.0
         self._stop_height: float | None = None
@@ -209,18 +290,32 @@ class LiftCalibrationSession:
         if not lift_authorized:
             self._reset_active()
             return PumpCommand.safe_stop()
-        timestamp = _finite_number("now", now, minimum=0)
-        height = _validated_sample(sample)
+        if self.failed:
+            return PumpCommand.safe_stop()
+        try:
+            timestamp, height, checked_feedback = _validate_session_inputs(
+                now=now,
+                sample=sample,
+                feedback=feedback,
+                last_now=self._last_now,
+                sensor_timeout_s=self._sensor_timeout_s,
+                feedback_timeout_s=self._feedback_timeout_s,
+                absolute_max_height_mm=self._absolute_max_height_mm,
+            )
+        except CalibrationError as exc:
+            return self._fail(str(exc))
+        self._last_now = timestamp
+        self.fault_reason = None
         if self.done:
             return PumpCommand.safe_stop()
         if self._active_started_at is None:
-            self._begin(timestamp, height, feedback)
+            self._begin(timestamp, height, checked_feedback)
             return PumpCommand(interlock=True, lift_pwm=self._current_pwm())
 
         elapsed = timestamp - self._active_started_at
         if elapsed < 0:
             raise CalibrationError("标定时钟不得回退")
-        self._observe(timestamp, height, feedback)
+        self._observe(timestamp, height, checked_feedback)
         # 调用时钟是浮点数，边界比较保留皮秒量级容差，避免 0.3 被表示为
         # 0.299999999999 而意外多通电一个控制周期。
         if elapsed + 1e-12 < 0.3:
@@ -233,7 +328,7 @@ class LiftCalibrationSession:
         self._finish(timestamp, height)
         if self.done:
             return PumpCommand.safe_stop()
-        self._begin(timestamp, height, feedback)
+        self._begin(timestamp, height, checked_feedback)
         return PumpCommand(interlock=True, lift_pwm=self._current_pwm())
 
     def _current_pwm(self) -> int:
@@ -287,16 +382,43 @@ class LiftCalibrationSession:
         self._stop_height = None
         self._first_movement_at = None
 
+    def _fail(self, reason: str) -> PumpCommand:
+        self.failed = True
+        self.fault_reason = reason
+        self._reset_active()
+        return PumpCommand.safe_stop()
+
 
 class LowerCalibrationSession:
     """确定性下降标定会话；起升字段在所有相位恒为零。"""
 
-    def __init__(self, *, direction_tolerance_mm: float = 0.5) -> None:
+    def __init__(
+        self,
+        *,
+        direction_tolerance_mm: float = 0.5,
+        sensor_timeout_s: float = 0.1,
+        feedback_timeout_s: float = 0.15,
+        absolute_max_height_mm: float = 2900.0,
+    ) -> None:
         self._direction_tolerance_mm = _finite_number(
             "direction_tolerance_mm", direction_tolerance_mm, minimum=0
         )
         self._index = 0
         self._trials: list[LowerTrial] = []
+        self._sensor_timeout_s = _session_timeout(
+            "sensor_timeout_s", sensor_timeout_s, 0.1
+        )
+        self._feedback_timeout_s = _session_timeout(
+            "feedback_timeout_s", feedback_timeout_s, 0.15
+        )
+        self._absolute_max_height_mm = _finite_number(
+            "absolute_max_height_mm", absolute_max_height_mm, minimum=0.001
+        )
+        if self._absolute_max_height_mm > 2900.0:
+            raise CalibrationError("absolute_max_height_mm 不得超过 2900")
+        self.failed = False
+        self.fault_reason: str | None = None
+        self._last_now: float | None = None
         self._active_started_at: float | None = None
         self._start_height = 0.0
         self._highest_height = 0.0
@@ -315,6 +437,7 @@ class LowerCalibrationSession:
         *,
         now: float,
         sample: HeightSample,
+        feedback: PumpFeedback | None,
         lower_authorized: bool,
     ) -> PumpCommand:
         """推进 150 ms 阀脉冲与随后 700 ms 观察；掉授权立即全零。"""
@@ -323,8 +446,22 @@ class LowerCalibrationSession:
         if not lower_authorized:
             self._reset_active()
             return PumpCommand.safe_stop()
-        timestamp = _finite_number("now", now, minimum=0)
-        height = _validated_sample(sample)
+        if self.failed:
+            return PumpCommand.safe_stop()
+        try:
+            timestamp, height, _checked_feedback = _validate_session_inputs(
+                now=now,
+                sample=sample,
+                feedback=feedback,
+                last_now=self._last_now,
+                sensor_timeout_s=self._sensor_timeout_s,
+                feedback_timeout_s=self._feedback_timeout_s,
+                absolute_max_height_mm=self._absolute_max_height_mm,
+            )
+        except CalibrationError as exc:
+            return self._fail(str(exc))
+        self._last_now = timestamp
+        self.fault_reason = None
         if self.done:
             return PumpCommand.safe_stop()
         if self._active_started_at is None:
@@ -374,6 +511,12 @@ class LowerCalibrationSession:
     def _reset_active(self) -> None:
         self._active_started_at = None
         self._first_movement_at = None
+
+    def _fail(self, reason: str) -> PumpCommand:
+        self.failed = True
+        self.fault_reason = reason
+        self._reset_active()
+        return PumpCommand.safe_stop()
 
 
 @dataclass(frozen=True)
@@ -624,16 +767,30 @@ class UpperLimitSurvey:
         sample: HeightSample,
         lift_authorized: bool,
     ) -> PumpCommand:
-        """推进一个测量周期；授权丢失会立即归零并重置连续通电段。"""
+        """推进测量周期；撤权立即归零，并把活动段转换为完整强制暂停。"""
         if type(lift_authorized) is not bool:
             raise CalibrationError("lift_authorized 必须是 bool")
-        if not lift_authorized:
-            self._on_started_at = None
-            # 授权切换不能清除已经开始的强制暂停，否则可通过抖动授权绕过
-            # survey_pause_s。未到暂停阶段时该字段本来就是 None。
-            return PumpCommand.safe_stop()
         if self.limit_reached or self.failed:
-            # 临时/绝对上限是本次测量的终止门禁，传感器轻微回落不得自动重启。
+            # 临时/绝对上限或输入故障是本次测量的终止门禁。
+            return PumpCommand.safe_stop()
+        if not lift_authorized:
+            try:
+                timestamp = _finite_number("now", now, minimum=0)
+                if self._last_now is not None and timestamp < self._last_now:
+                    raise CalibrationError("上限测量时钟不得回退")
+            except CalibrationError as exc:
+                self._on_started_at = None
+                self.failed = True
+                self.fault_reason = str(exc)
+                return PumpCommand.safe_stop()
+            self._last_now = timestamp
+            if self._on_started_at is not None:
+                mandatory_pause_until = timestamp + self.config.survey_pause_s
+                self._pause_until = max(
+                    self._pause_until or mandatory_pause_until,
+                    mandatory_pause_until,
+                )
+            self._on_started_at = None
             return PumpCommand.safe_stop()
         try:
             timestamp = _finite_number("now", now, minimum=0)

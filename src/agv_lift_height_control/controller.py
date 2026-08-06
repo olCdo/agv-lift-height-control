@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from math import isfinite
 
-from .calibration import CalibrationBundle
+from .calibration import LIFT_PWM_LEVELS, CalibrationBundle
 from .config import ControlConfig
 from .types import HeightSample, PumpCommand, PumpFeedback
 
@@ -26,6 +26,15 @@ class ControllerState(str, Enum):
     MANUAL_LOWER = "manual_lower"
     SURVEY = "survey"
     FAULT = "fault"
+
+
+EXTERNAL_CONTROLLER_STATES = frozenset(
+    {
+        ControllerState.LIFT_CALIBRATION,
+        ControllerState.LOWER_CALIBRATION,
+        ControllerState.SURVEY,
+    }
+)
 
 
 def _finite_nonnegative(value: object) -> bool:
@@ -68,6 +77,9 @@ class HeightController:
 
         self.state = ControllerState.MONITOR
         self.fault_reason: str | None = None
+        self.fault_kind: str | None = None
+        self.fault_height_mm: float | None = None
+        self.fault_timestamp: float | None = None
         self.trial_failed = False
         self._target_mm: float | None = None
         self._effective_upper_limit_mm = calibration.soft_upper_limit_mm
@@ -79,7 +91,10 @@ class HeightController:
         self._last_sample: HeightSample | None = None
         self._last_command = PumpCommand.safe_stop()
         self._overcurrent_since: float | None = None
+        self._overcurrent_pwm: int | None = None
         self._latched_overcurrent_pwm: int | None = None
+        self._direction_recovery_reference_mm: float | None = None
+        self._direction_recovery_since: float | None = None
 
     @property
     def target_mm(self) -> float | None:
@@ -96,6 +111,8 @@ class HeightController:
         temporary_max_height_mm: float | None = None,
     ) -> None:
         """设置自动起升目标；无持久软限位时强制提供人工临时上限。"""
+        if self.state in EXTERNAL_CONTROLLER_STATES:
+            raise RuntimeError("外部模式中禁止设置自动目标")
         target = self._validate_height_argument("target_mm", target_mm)
         persistent = self.calibration.soft_upper_limit_mm
         if temporary_max_height_mm is None:
@@ -127,13 +144,18 @@ class HeightController:
         self._stable_since = None
         self._pulse_phase_started = None
         self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
-        if self.state is not ControllerState.FAULT:
+        if (
+            self.state is not ControllerState.FAULT
+            and self.state not in EXTERNAL_CONTROLLER_STATES
+        ):
             self.state = ControllerState.MONITOR
 
     def set_manual_lower(self, active: bool) -> None:
         """设置人工下降意图；使能时取消自动目标，实际阀输出仍由 step 授权门控。"""
         if type(active) is not bool:
             raise TypeError("active 必须是 bool")
+        if self.state in EXTERNAL_CONTROLLER_STATES:
+            raise RuntimeError("外部模式中禁止设置人工下降")
         self._manual_lower = active
         if active:
             self._target_mm = None
@@ -146,6 +168,36 @@ class HeightController:
     def clear_fault(self) -> None:
         """请求清故障；只有下一次 step 的所有门禁恢复后才真正退出 FAULT。"""
         self._fault_clear_requested = True
+        if self.state is ControllerState.FAULT and self.fault_kind == "direction":
+            self._direction_recovery_reference_mm = self.fault_height_mm
+            self._direction_recovery_since = None
+
+    def enter_external_mode(self, mode: ControllerState) -> None:
+        """进入由独立标定/测量会话拥有命令源的外部安全模式。"""
+        if not isinstance(mode, ControllerState) or mode not in EXTERNAL_CONTROLLER_STATES:
+            raise ValueError("外部模式只能是起升标定、下降标定或上限测量")
+        if self.state is ControllerState.FAULT:
+            raise RuntimeError("故障未清除时禁止进入外部模式")
+        self._target_mm = None
+        self._manual_lower = False
+        self._stable_since = None
+        self._pulse_phase_started = None
+        self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
+        # 命令源所有权在此原子切换；旧自动命令的方向/过流历史不能污染
+        # 外部标定或 Survey 状态，否则 controller.step 会把安全模式误锁故障。
+        self._last_command = PumpCommand.safe_stop()
+        self._last_sample = None
+        self._overcurrent_since = None
+        self._overcurrent_pwm = None
+        self._latched_overcurrent_pwm = None
+        self._fault_clear_requested = False
+        self.state = mode
+
+    def exit_external_mode(self) -> None:
+        """退出外部命令源模式；故障状态下调用不会绕过故障锁存。"""
+        if self.state in EXTERNAL_CONTROLLER_STATES:
+            self.state = ControllerState.MONITOR
+            self._last_command = PumpCommand.safe_stop()
 
     def step(
         self,
@@ -159,17 +211,17 @@ class HeightController:
         """执行一个控制周期，并返回经过全部失效保护后的实际命令。"""
         safe_stop = PumpCommand.safe_stop()
         if not _finite_nonnegative(now):
-            return self._fault("本机 now 时间戳无效")
+            return self._fault("本机 now 时间戳无效", kind="input")
         timestamp = float(now)
 
         # 只要本机时钟有效就记录控制循环到达，其他输入故障不应伪装成线程停顿。
         if self._last_step_at is not None:
             gap = timestamp - self._last_step_at
             if gap < 0:
-                return self._fault("本机时钟回退")
+                return self._fault("本机时钟回退", kind="input", timestamp=timestamp)
             if gap - self.config.control_loop_timeout_s > 1e-12:
                 self._last_step_at = timestamp
-                return self._fault("控制循环已超时")
+                return self._fault("控制循环已超时", kind="timeout", timestamp=timestamp)
         self._last_step_at = timestamp
 
         guard_reason = self._validate_inputs(
@@ -180,13 +232,30 @@ class HeightController:
             lower_authorized,
         )
         if guard_reason is not None:
-            return self._fault(guard_reason)
+            kind = "direction" if guard_reason == "起升命令下高度方向反向" else "input"
+            fault_height = (
+                float(sample.height_mm)
+                if isinstance(sample, HeightSample)
+                and _finite_nonnegative(sample.height_mm)
+                else None
+            )
+            return self._fault(
+                guard_reason,
+                kind=kind,
+                height_mm=fault_height,
+                timestamp=timestamp,
+            )
         assert feedback is not None
         assert sample.height_mm is not None
 
         current_reason = self._check_overcurrent(timestamp, feedback)
         if current_reason is not None:
-            return self._fault(current_reason)
+            return self._fault(
+                current_reason,
+                kind="overcurrent",
+                height_mm=float(sample.height_mm),
+                timestamp=timestamp,
+            )
 
         if (
             self.state is ControllerState.FAULT
@@ -196,6 +265,12 @@ class HeightController:
             peak = self.calibration.peak_current_by_pwm[self._latched_overcurrent_pwm]
             if feedback.current_raw > self.config.current_multiplier * peak:
                 return self._fault("泵电流仍高于标定阈值，过流条件未恢复")
+
+        if self.state is ControllerState.FAULT and self.fault_kind == "direction":
+            self._last_sample = sample
+            return self._handle_direction_fault_recovery(
+                timestamp, float(sample.height_mm)
+            )
 
         # 门禁通过后才更新相邻样本基准；用于下一周期速度和起升方向检查。
         self._last_sample = sample
@@ -211,10 +286,20 @@ class HeightController:
                 else ControllerState.MONITOR
             )
             self.fault_reason = None
+            self.fault_kind = None
+            self.fault_height_mm = None
+            self.fault_timestamp = None
             self.trial_failed = False
             self._fault_clear_requested = False
             self._overcurrent_since = None
+            self._overcurrent_pwm = None
             self._latched_overcurrent_pwm = None
+
+        if self.state in EXTERNAL_CONTROLLER_STATES:
+            # 标定/Survey 会话是该模式唯一命令源；控制器仍执行上方门禁，
+            # 但自身永远返回全零，避免与外部会话同时驱动泵。
+            self._last_command = safe_stop
+            return safe_stop
 
         if self._manual_lower:
             self.state = ControllerState.MANUAL_LOWER
@@ -309,8 +394,15 @@ class HeightController:
         peak = self.calibration.peak_current_by_pwm.get(pwm)
         if pwm == 0 or peak is None:
             self._overcurrent_since = None
+            self._overcurrent_pwm = None
             return None
         threshold = self.config.current_multiplier * peak
+        if self._overcurrent_pwm != pwm:
+            # 过流持续时间只属于具体实测 PWM；换挡后必须从新 PWM 的首帧
+            # 重新计时，不能沿用上一档积累的时间。
+            self._overcurrent_pwm = pwm
+            self._overcurrent_since = now if feedback.current_raw > threshold else None
+            return None
         if feedback.current_raw <= threshold:
             self._overcurrent_since = None
             return None
@@ -327,7 +419,12 @@ class HeightController:
         error = self._target_mm - height_mm
         overshoot = -error
         if overshoot > self.config.overshoot_limit_mm:
-            return self._fault(f"目标超调 {overshoot:.3f} mm，超过安全上限")
+            return self._fault(
+                f"目标超调 {overshoot:.3f} mm，超过安全上限",
+                kind="overshoot",
+                height_mm=height_mm,
+                timestamp=now,
+            )
         if error < -self.config.tolerance_mm:
             self.state = ControllerState.IDLE
             self.trial_failed = True
@@ -355,12 +452,22 @@ class HeightController:
             scale = (error - self.pulse_zone_mm) / (
                 self.slow_zone_mm - self.pulse_zone_mm
             )
-            pwm = round(
+            raw_pwm = (
                 self.calibration.min_stable_pwm
                 + scale
                 * (self.calibration.coarse_pwm - self.calibration.min_stable_pwm)
             )
-            pwm = min(max(pwm, self.calibration.min_stable_pwm), self.calibration.coarse_pwm)
+            # 向上量化到已标定的 5-PWM 档，牺牲少量平滑性换取每条实际命令
+            # 都有同 PWM 峰值电流可用于持续过流保护。
+            measured_levels = (
+                level
+                for level in LIFT_PWM_LEVELS
+                if self.calibration.min_stable_pwm
+                <= level
+                <= self.calibration.coarse_pwm
+                and level >= raw_pwm
+            )
+            pwm = next(measured_levels, self.calibration.coarse_pwm)
             return self._lift_command(pwm, height_mm)
 
         if self.state is not ControllerState.TERMINAL_PULSE or self._pulse_phase_started is None:
@@ -382,7 +489,56 @@ class HeightController:
             return self._fault("达到绝对上限后仍请求起升")
         return PumpCommand(interlock=True, lift_pwm=pwm)
 
-    def _fault(self, reason: str) -> PumpCommand:
+    def _handle_direction_fault_recovery(
+        self, now: float, height_mm: float
+    ) -> PumpCommand:
+        """方向故障仅在明确请求后、连续稳定观察完成的下一周期才可运动。"""
+        safe_stop = PumpCommand.safe_stop()
+        self._last_command = safe_stop
+        if not self._fault_clear_requested:
+            return safe_stop
+        reference = self._direction_recovery_reference_mm
+        if reference is None:
+            reference = height_mm
+            self._direction_recovery_reference_mm = height_mm
+        if height_mm < reference - self.config.direction_tolerance_mm:
+            # 累计下降超过容差说明反向趋势仍在，稳定窗口从新低点重新计时。
+            self._direction_recovery_reference_mm = height_mm
+            self._direction_recovery_since = now
+            return safe_stop
+        if self._direction_recovery_since is None:
+            self._direction_recovery_since = now
+            return safe_stop
+        if now - self._direction_recovery_since + 1e-12 < self.config.stable_time_s:
+            return safe_stop
+
+        self.state = ControllerState.IDLE if self._target_mm is not None else ControllerState.MONITOR
+        self.fault_reason = None
+        self.fault_kind = None
+        self.fault_height_mm = None
+        self.fault_timestamp = None
+        self.trial_failed = False
+        self._fault_clear_requested = False
+        self._direction_recovery_reference_mm = None
+        self._direction_recovery_since = None
+        # 清除完成周期仍返回零；下一周期才重新进入自动状态机。
+        return safe_stop
+
+    def _fault(
+        self,
+        reason: str,
+        *,
+        kind: str | None = None,
+        height_mm: float | None = None,
+        timestamp: float | None = None,
+    ) -> PumpCommand:
+        if self.state is not ControllerState.FAULT:
+            self.fault_kind = kind or "safety"
+            self.fault_height_mm = height_mm
+            self.fault_timestamp = timestamp
+            if self.fault_kind == "direction":
+                self._direction_recovery_reference_mm = height_mm
+                self._direction_recovery_since = None
         self.state = ControllerState.FAULT
         self.fault_reason = reason
         self.trial_failed = True

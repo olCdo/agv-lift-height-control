@@ -61,14 +61,14 @@ def test_survey_limits_each_lift_segment_to_one_second_then_pauses() -> None:
     assert survey.step(now=1.5, sample=sample(1.5, 102.5), lift_authorized=True).lift_pwm == 50
 
 
-def test_survey_authorization_loss_stops_and_resets_continuous_segment() -> None:
+def test_survey_authorization_loss_stops_and_forces_full_pause() -> None:
     survey = UpperLimitSurvey(config(), bundle(), temporary_max_height_mm=1200.0)
     survey.step(now=0.0, sample=sample(0.0, 100.0), lift_authorized=True)
 
     assert survey.step(now=0.2, sample=sample(0.2, 101.0), lift_authorized=False).lift_pwm == 0
-    assert survey.step(now=0.3, sample=sample(0.3, 101.0), lift_authorized=True).lift_pwm == 50
-    assert survey.step(now=1.299, sample=sample(1.299, 102.0), lift_authorized=True).lift_pwm == 50
-    assert survey.step(now=1.3, sample=sample(1.3, 103.0), lift_authorized=True).lift_pwm == 0
+    assert survey.step(now=0.3, sample=sample(0.3, 101.0), lift_authorized=True).lift_pwm == 0
+    assert survey.step(now=0.699, sample=sample(0.699, 101.0), lift_authorized=True).lift_pwm == 0
+    assert survey.step(now=0.7, sample=sample(0.7, 101.0), lift_authorized=True).lift_pwm == 50
 
 
 def test_survey_authorization_loss_returns_zero_even_with_invalid_sample() -> None:
@@ -82,6 +82,76 @@ def test_survey_authorization_loss_returns_zero_even_with_invalid_sample() -> No
     )
 
     assert command.lift_pwm == command.lower_valve == 0
+    assert survey.step(
+        now=0.2, sample=sample(0.2, 100.0), lift_authorized=True
+    ).lift_pwm == 0
+    assert survey.step(
+        now=0.6, sample=sample(0.6, 100.0), lift_authorized=True
+    ).lift_pwm == 50
+
+
+def test_survey_999ms_authorization_toggles_cannot_avoid_pause() -> None:
+    survey = UpperLimitSurvey(config(), bundle(), temporary_max_height_mm=1200.0)
+    assert survey.step(
+        now=0.0, sample=sample(0.0, 100.0), lift_authorized=True
+    ).lift_pwm == 50
+    assert survey.step(
+        now=0.999, sample=sample(0.999, 101.0), lift_authorized=True
+    ).lift_pwm == 50
+    assert survey.step(
+        now=1.0, sample=sample(1.0, 101.0), lift_authorized=False
+    ).lift_pwm == 0
+    assert survey.step(
+        now=1.001, sample=sample(1.001, 101.0), lift_authorized=True
+    ).lift_pwm == 0
+    assert survey.step(
+        now=1.5, sample=sample(1.5, 101.0), lift_authorized=True
+    ).lift_pwm == 50
+    assert survey.step(
+        now=2.499, sample=sample(2.499, 102.0), lift_authorized=True
+    ).lift_pwm == 50
+    assert survey.step(
+        now=2.5, sample=sample(2.5, 102.0), lift_authorized=False
+    ).lift_pwm == 0
+    assert survey.step(
+        now=2.501, sample=sample(2.501, 102.0), lift_authorized=True
+    ).lift_pwm == 0
+    assert survey.step(
+        now=3.0, sample=sample(3.0, 102.0), lift_authorized=True
+    ).lift_pwm == 50
+
+
+@pytest.mark.parametrize("bad_now", [float("nan"), -1.0])
+def test_survey_invalid_clock_during_authorization_loss_latches_failure(
+    bad_now: float,
+) -> None:
+    survey = UpperLimitSurvey(config(), bundle(), temporary_max_height_mm=1200.0)
+    survey.step(now=0.0, sample=sample(0.0, 100.0), lift_authorized=True)
+
+    command = survey.step(
+        now=bad_now,
+        sample=HeightSample(bad_now, None, None, False, "lost"),
+        lift_authorized=False,
+    )
+
+    assert command.lift_pwm == 0
+    assert survey.failed
+    assert "now" in (survey.fault_reason or "")
+
+
+def test_survey_clock_rollback_during_authorization_loss_latches_failure() -> None:
+    survey = UpperLimitSurvey(config(), bundle(), temporary_max_height_mm=1200.0)
+    survey.step(now=1.0, sample=sample(1.0, 100.0), lift_authorized=True)
+
+    command = survey.step(
+        now=0.9,
+        sample=sample(0.9, 100.0),
+        lift_authorized=False,
+    )
+
+    assert command.lift_pwm == 0
+    assert survey.failed
+    assert "回退" in (survey.fault_reason or "")
 
 
 def test_survey_invalid_sample_after_lift_fails_closed_without_exception() -> None:

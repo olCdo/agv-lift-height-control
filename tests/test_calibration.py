@@ -22,8 +22,8 @@ def sample(timestamp: float, height_mm: float, *, valid: bool = True) -> HeightS
     return HeightSample(timestamp, 100, height_mm, valid, None if valid else "bad")
 
 
-def feedback(timestamp: float, current: int = 100) -> PumpFeedback:
-    return PumpFeedback(timestamp, current, 0, 0)
+def feedback(timestamp: float, current: int = 100, *, fault: int = 0) -> PumpFeedback:
+    return PumpFeedback(timestamp, current, fault, 0)
 
 
 def complete_lift_trials() -> tuple[LiftTrial, ...]:
@@ -161,6 +161,7 @@ def test_lower_session_uses_150ms_pulse_and_700ms_observation() -> None:
     assert session.step(
         now=now,
         sample=sample(now, height),
+        feedback=feedback(now),
         lower_authorized=True,
     ).lower_valve == 0x10
 
@@ -168,11 +169,13 @@ def test_lower_session_uses_150ms_pulse_and_700ms_observation() -> None:
         assert session.step(
             now=now + 0.15,
             sample=sample(now + 0.15, height - 1.0),
+            feedback=feedback(now + 0.15),
             lower_authorized=True,
         ).lower_valve == 0
         command = session.step(
             now=now + 0.85,
             sample=sample(now + 0.85, height - 2.0),
+            feedback=feedback(now + 0.85),
             lower_authorized=True,
         )
         assert command.lift_pwm == 0
@@ -186,13 +189,120 @@ def test_lower_session_uses_150ms_pulse_and_700ms_observation() -> None:
 
 def test_lower_session_authorization_loss_immediately_stops() -> None:
     session = LowerCalibrationSession()
-    session.step(now=0.0, sample=sample(0.0, 100.0), lower_authorized=True)
+    session.step(
+        now=0.0,
+        sample=sample(0.0, 100.0),
+        feedback=feedback(0.0),
+        lower_authorized=True,
+    )
 
-    command = session.step(now=0.05, sample=sample(0.05, 99.9), lower_authorized=False)
+    command = session.step(
+        now=0.05,
+        sample=sample(0.05, 99.9),
+        feedback=feedback(0.05),
+        lower_authorized=False,
+    )
 
     assert command.lift_pwm == 0
     assert command.lower_valve == 0
     assert session.trials == ()
+
+
+def test_lift_session_expired_sample_latches_failure_during_output() -> None:
+    session = LiftCalibrationSession()
+    assert session.step(
+        now=0.0,
+        sample=sample(0.0, 100.0),
+        feedback=feedback(0.0),
+        lift_authorized=True,
+    ).lift_pwm == 40
+
+    command = session.step(
+        now=0.2,
+        sample=sample(0.0, 100.2),
+        feedback=feedback(0.2),
+        lift_authorized=True,
+    )
+
+    assert command.lift_pwm == command.lower_valve == 0
+    assert session.failed
+    assert "超时" in (session.fault_reason or "")
+    assert session.step(
+        now=0.21,
+        sample=sample(0.21, 100.2),
+        feedback=feedback(0.21),
+        lift_authorized=True,
+    ).lift_pwm == 0
+
+
+def test_lift_session_missing_feedback_fails_closed() -> None:
+    session = LiftCalibrationSession()
+
+    command = session.step(
+        now=0.0,
+        sample=sample(0.0, 100.0),
+        feedback=None,
+        lift_authorized=True,
+    )
+
+    assert command.lift_pwm == 0
+    assert session.failed
+    assert "反馈" in (session.fault_reason or "")
+
+
+def test_lower_session_feedback_fault_during_output_latches_failure() -> None:
+    session = LowerCalibrationSession()
+    assert session.step(
+        now=0.0,
+        sample=sample(0.0, 100.0),
+        feedback=feedback(0.0),
+        lower_authorized=True,
+    ).lower_valve == 0x10
+
+    command = session.step(
+        now=0.05,
+        sample=sample(0.05, 99.9),
+        feedback=feedback(0.05, fault=7),
+        lower_authorized=True,
+    )
+
+    assert command.lower_valve == command.lift_pwm == 0
+    assert session.failed
+    assert "故障码 7" in (session.fault_reason or "")
+    assert session.step(
+        now=float("nan"),
+        sample=HeightSample(float("nan"), None, None, False, "bad"),
+        feedback=None,
+        lower_authorized=False,
+    ).lower_valve == 0
+    assert session.failed
+
+
+def test_lower_session_missing_feedback_and_clock_rollback_fail_closed() -> None:
+    missing = LowerCalibrationSession()
+    assert missing.step(
+        now=0.0,
+        sample=sample(0.0, 100.0),
+        feedback=None,
+        lower_authorized=True,
+    ).lower_valve == 0
+    assert missing.failed
+
+    rollback = LowerCalibrationSession()
+    assert rollback.step(
+        now=0.1,
+        sample=sample(0.1, 100.0),
+        feedback=feedback(0.1),
+        lower_authorized=True,
+    ).lower_valve == 0x10
+    assert rollback.step(
+        now=0.05,
+        sample=sample(0.05, 100.0),
+        feedback=feedback(0.05),
+        lower_authorized=True,
+    ).lower_valve == 0
+    assert rollback.failed
+    assert "回退" in (rollback.fault_reason or "")
 
 
 def test_calibration_store_round_trip_and_atomic_file(tmp_path) -> None:

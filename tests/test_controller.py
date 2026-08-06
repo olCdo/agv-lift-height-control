@@ -251,6 +251,99 @@ def test_adjacent_sample_speed_and_lift_direction_are_guarded() -> None:
     assert "方向" in (direction_controller.fault_reason or "")
 
 
+def test_direction_fault_clear_requires_500ms_stable_observation_and_zero_clear_cycle() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(300.0)
+    assert step(controller, 0.0, 100.0).lift_pwm == 70
+
+    assert step(controller, 0.05, 98.9).lift_pwm == 0
+    assert controller.state is ControllerState.FAULT
+    assert controller.fault_kind == "direction"
+    assert controller.fault_height_mm == pytest.approx(98.9)
+    assert controller.fault_timestamp == pytest.approx(0.05)
+
+    controller.clear_fault()
+    assert step(controller, 0.1, 98.0).lift_pwm == 0
+    assert controller.state is ControllerState.FAULT
+    # 相对故障高度累计下降超过 1 mm，必须从新低点重新计稳定窗口。
+    assert step(controller, 0.2, 97.8).lift_pwm == 0
+    assert controller.state is ControllerState.FAULT
+    for now in (0.3, 0.4, 0.5, 0.6):
+        assert step(controller, now, 97.8).lift_pwm == 0
+        assert controller.state is ControllerState.FAULT
+
+    cleared = step(controller, 0.7, 97.8)
+    assert cleared.lift_pwm == cleared.lower_valve == 0
+    assert controller.state is ControllerState.IDLE
+    assert controller.fault_reason is None
+    assert step(controller, 0.75, 97.8).lift_pwm == 70
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        ControllerState.LIFT_CALIBRATION,
+        ControllerState.LOWER_CALIBRATION,
+        ControllerState.SURVEY,
+    ],
+)
+def test_external_modes_are_reachable_and_exclude_automatic_output(
+    mode: ControllerState,
+) -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(300.0)
+
+    controller.enter_external_mode(mode)
+
+    assert controller.state is mode
+    assert controller.target_mm is None
+    command = step(
+        controller,
+        0.0,
+        100.0,
+        lift_authorized=True,
+        lower_authorized=True,
+    )
+    assert command.lift_pwm == command.lower_valve == 0
+    assert controller.state is mode
+    with pytest.raises(RuntimeError, match="外部模式"):
+        controller.set_target(200.0)
+    with pytest.raises(RuntimeError, match="外部模式"):
+        controller.set_manual_lower(True)
+    controller.cancel()
+    assert controller.state is mode
+    controller.exit_external_mode()
+    assert controller.state is ControllerState.MONITOR
+
+
+def test_external_mode_cancels_manual_lower_and_rejects_non_external_state() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_manual_lower(True)
+
+    controller.enter_external_mode(ControllerState.LOWER_CALIBRATION)
+
+    assert step(
+        controller, 0.0, 100.0, lower_authorized=True
+    ).lower_valve == 0
+    with pytest.raises(ValueError, match="外部"):
+        controller.enter_external_mode(ControllerState.HOLD)
+
+
+def test_enter_external_mode_discards_old_lift_direction_and_current_history() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(600.0)
+    assert step(controller, 0.0, 300.0, current=1100).lift_pwm == 70
+    assert step(controller, 0.1, 300.0, current=1100).lift_pwm == 70
+    assert step(controller, 0.2, 300.0, current=1100).lift_pwm == 70
+
+    controller.enter_external_mode(ControllerState.SURVEY)
+    command = step(controller, 0.3, 98.9, current=65535)
+
+    assert command.lift_pwm == command.lower_valve == 0
+    assert controller.state is ControllerState.SURVEY
+    assert controller.fault_reason is None
+
+
 def test_same_pwm_overcurrent_must_persist_for_200ms() -> None:
     controller = HeightController(control_config(), calibration())
     controller.set_target(300.0)
@@ -276,14 +369,45 @@ def test_same_pwm_overcurrent_must_persist_for_200ms() -> None:
     assert controller.state is ControllerState.COARSE_LIFT
 
 
-def test_unmeasured_p_pwm_current_does_not_trigger_peak_guard() -> None:
+def test_p_control_quantizes_up_to_a_measured_pwm_level() -> None:
     controller = HeightController(control_config(), calibration())
     controller.set_target(130.0)
 
-    for index in range(4):
-        command = step(controller, index * 0.1, 100.0, current=65535)
-        assert command.lift_pwm not in {0, 50, 70}
-        assert controller.state is not ControllerState.FAULT
+    command = step(controller, 0.0, 100.0)
+
+    assert command.lift_pwm == 60
+    assert command.lift_pwm in controller.calibration.peak_current_by_pwm
+
+
+def test_quantized_p_pwm_has_its_own_200ms_overcurrent_guard() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(130.0)
+
+    assert step(controller, 0.0, 100.0, current=1000).lift_pwm == 60
+    assert step(controller, 0.1, 100.0, current=1000).lift_pwm == 60
+    assert step(controller, 0.2, 100.0, current=1000).lift_pwm == 60
+    command = step(controller, 0.3, 100.0, current=1000)
+
+    assert command.lift_pwm == 0
+    assert controller.state is ControllerState.FAULT
+    assert "PWM 60" in (controller.fault_reason or "")
+
+
+def test_overcurrent_timer_restarts_when_actual_pwm_changes() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(120.0)
+
+    assert step(controller, 0.0, 100.0, current=1000).lift_pwm == 55
+    assert step(controller, 0.1, 100.0, current=1000).lift_pwm == 55
+    controller.set_target(130.0)
+    assert step(controller, 0.2, 100.0, current=1000).lift_pwm == 60
+    assert step(controller, 0.3, 100.0, current=1000).lift_pwm == 60
+    assert step(controller, 0.4, 100.0, current=1000).lift_pwm == 60
+    command = step(controller, 0.5, 100.0, current=1000)
+
+    assert command.lift_pwm == 0
+    assert controller.state is ControllerState.FAULT
+    assert "PWM 60" in (controller.fault_reason or "")
 
 
 def test_manual_lower_current_never_uses_lift_peak_guard() -> None:
