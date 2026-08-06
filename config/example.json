@@ -1,0 +1,22 @@
+{
+  "sensor": {
+    "transport": "rtu",
+    "port": "/dev/ttyS7",
+    "baudrate": 115200,
+    "bytesize": 8,
+    "parity": "N",
+    "stopbits": 1,
+    "timeout_s": 0.1,
+    "slave_id": 3,
+    "register_address": 0,
+    "register_count": 2,
+    "word_order": "high_low",
+    "wheel_circumference_mm": 200.0,
+    "counts_per_revolution": 4096,
+    "range_mm": 3000.0,
+    "poll_period_s": 0.02
+  },
+  "can": {},
+  "control": {},
+  "storage": {}
+}
