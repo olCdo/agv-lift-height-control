@@ -1,4 +1,4 @@
-"""JSON 配置加载和 v1 RTU 传感器参数校验。"""
+"""JSON 配置加载与传感器、CAN、控制安全参数的严格校验。"""
 
 import json
 from dataclasses import dataclass
@@ -102,16 +102,79 @@ class CanConfig:
 
 
 @dataclass(frozen=True)
+class ControlConfig:
+    """高度闭环的安全阈值；长度单位为 mm，时间单位为秒。"""
+
+    tolerance_mm: float
+    stable_time_s: float
+    overshoot_limit_mm: float
+    absolute_max_height_mm: float
+    max_speed_mm_s: float
+    sensor_timeout_s: float
+    control_loop_timeout_s: float
+    current_multiplier: float
+    current_duration_s: float
+    direction_tolerance_mm: float
+    survey_max_on_s: float
+    survey_pause_s: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "tolerance_mm",
+            "stable_time_s",
+            "overshoot_limit_mm",
+            "max_speed_mm_s",
+            "sensor_timeout_s",
+            "control_loop_timeout_s",
+            "current_duration_s",
+            "direction_tolerance_mm",
+            "survey_max_on_s",
+            "survey_pause_s",
+        ):
+            _validate_number_value(name, getattr(self, name), section="control")
+        upper_bounds = {
+            "tolerance_mm": 2.0,
+            "overshoot_limit_mm": 5.0,
+            "max_speed_mm_s": 1200.0,
+            "sensor_timeout_s": 0.1,
+            "control_loop_timeout_s": 0.1,
+            "current_duration_s": 0.2,
+            "direction_tolerance_mm": 2.0,
+            "survey_max_on_s": 1.0,
+        }
+        for name, maximum in upper_bounds.items():
+            if getattr(self, name) > maximum:
+                raise ConfigError(f"control.{name} 不得超过 {maximum}")
+        if self.stable_time_s < 0.5:
+            raise ConfigError("control.stable_time_s 不得小于 0.5")
+        _validate_number_range(
+            "absolute_max_height_mm",
+            self.absolute_max_height_mm,
+            0.001,
+            2900.0,
+            section="control",
+        )
+        multiplier = _validate_number_value(
+            "current_multiplier", self.current_multiplier, section="control"
+        )
+        if not 1.0 < multiplier <= 1.5:
+            raise ConfigError("control.current_multiplier 必须大于 1 且不超过 1.5")
+        if self.tolerance_mm >= self.overshoot_limit_mm:
+            raise ConfigError("control.tolerance_mm 必须小于 overshoot_limit_mm")
+
+
+@dataclass(frozen=True)
 class AppConfig:
     sensor: SensorConfig
     can: CanConfig
-    control: dict[str, Any]
+    control: ControlConfig
     storage: dict[str, Any]
 
 
 ROOT_FIELDS = frozenset({"sensor", "can", "control", "storage"})
 SENSOR_FIELDS = frozenset(SensorConfig.__dataclass_fields__)
 CAN_FIELDS = frozenset(CanConfig.__dataclass_fields__)
+CONTROL_FIELDS = frozenset(ControlConfig.__dataclass_fields__)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -133,7 +196,7 @@ def load_config(path: str | Path) -> AppConfig:
     return AppConfig(
         sensor=_parse_sensor(sections["sensor"]),
         can=_parse_can(sections["can"]),
-        control=sections["control"],
+        control=_parse_control(sections["control"]),
         storage=sections["storage"],
     )
 
@@ -202,6 +265,17 @@ def _parse_can(data: dict[str, Any]) -> CanConfig:
     )
 
 
+def _parse_control(data: dict[str, Any]) -> ControlConfig:
+    """逐字段解析控制阈值，禁止拼写错误被静默忽略。"""
+    _reject_unknown_fields(data, CONTROL_FIELDS, "control 配置")
+    return ControlConfig(
+        **{
+            name: _number(data, name, positive=True, section="control")
+            for name in CONTROL_FIELDS
+        }
+    )
+
+
 def _string(data: dict[str, Any], name: str, *, section: str = "sensor") -> str:
     value = data.get(name)
     if not isinstance(value, str):
@@ -262,8 +336,15 @@ def _validate_number_value(
     return result
 
 
-def _validate_number_range(name: str, value: object, minimum: float, maximum: float) -> float:
-    result = _validate_number_value(name, value, section="can")
+def _validate_number_range(
+    name: str,
+    value: object,
+    minimum: float,
+    maximum: float,
+    *,
+    section: str = "can",
+) -> float:
+    result = _validate_number_value(name, value, section=section)
     if not minimum <= result <= maximum:
-        raise ConfigError(f"can.{name} 超出允许范围 {minimum}..{maximum}")
+        raise ConfigError(f"{section}.{name} 超出允许范围 {minimum}..{maximum}")
     return result

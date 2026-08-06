@@ -11,8 +11,26 @@ from .can_pump import (
     parse_pump_feedback,
     select_safe_command,
 )
-from .config import AppConfig, CanConfig, ConfigError, SensorConfig, load_config
+from .calibration import (
+    LIFT_PWM_LEVELS,
+    LOWER_VALVE_LEVELS,
+    CalibrationBundle,
+    CalibrationError,
+    CalibrationStore,
+    LiftCalibrationResult,
+    LiftCalibrationSession,
+    LiftTrial,
+    LowerCalibrationResult,
+    LowerCalibrationSession,
+    LowerTrial,
+    UpperLimitSurvey,
+    analyze_lift_trials,
+    analyze_lower_trials,
+)
+from .config import AppConfig, CanConfig, ConfigError, ControlConfig, SensorConfig, load_config
+from .controller import ControllerState, HeightController
 from .modbus_rtu import ModbusRtuHeightSource
+from .simulation import HydraulicLiftSimulator, HydraulicSnapshot
 from .types import HeightSample, HeightSource, PumpCommand, PumpFeedback
 
 __all__ = [
@@ -22,10 +40,27 @@ __all__ = [
     "CanConfig",
     "CanPump",
     "CanPumpError",
+    "CalibrationBundle",
+    "CalibrationError",
+    "CalibrationStore",
     "ConfigError",
+    "ControlConfig",
+    "ControllerState",
     "HeightSample",
+    "HeightController",
     "HeightSource",
+    "HydraulicLiftSimulator",
+    "HydraulicSnapshot",
     "ModbusRtuHeightSource",
+    "LIFT_PWM_LEVELS",
+    "LOWER_VALVE_LEVELS",
+    "LiftCalibrationResult",
+    "LiftCalibrationSession",
+    "LiftTrial",
+    "LowerCalibrationResult",
+    "LowerCalibrationSession",
+    "LowerTrial",
+    "UpperLimitSurvey",
     "PumpCommand",
     "PumpFeedback",
     "SensorConfig",
@@ -35,4 +70,6 @@ __all__ = [
     "load_config",
     "parse_pump_feedback",
     "select_safe_command",
+    "analyze_lift_trials",
+    "analyze_lower_trials",
 ]

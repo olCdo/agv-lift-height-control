@@ -29,6 +29,19 @@
     "startup_nmt_s": 5.0,
     "shutdown_zero_frames": 3
   },
-  "control": {},
+  "control": {
+    "tolerance_mm": 2.0,
+    "stable_time_s": 0.5,
+    "overshoot_limit_mm": 5.0,
+    "absolute_max_height_mm": 2900.0,
+    "max_speed_mm_s": 1200.0,
+    "sensor_timeout_s": 0.1,
+    "control_loop_timeout_s": 0.1,
+    "current_multiplier": 1.5,
+    "current_duration_s": 0.2,
+    "direction_tolerance_mm": 1.0,
+    "survey_max_on_s": 1.0,
+    "survey_pause_s": 0.5
+  },
   "storage": {}
 }

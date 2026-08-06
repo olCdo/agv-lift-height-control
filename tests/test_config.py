@@ -3,7 +3,24 @@ import json
 import pytest
 
 import agv_lift_height_control as package
-from agv_lift_height_control import ConfigError, SensorConfig, load_config
+from agv_lift_height_control import ConfigError, ControlConfig, SensorConfig, load_config
+
+
+def valid_control_config() -> dict[str, object]:
+    return {
+        "tolerance_mm": 2.0,
+        "stable_time_s": 0.5,
+        "overshoot_limit_mm": 5.0,
+        "absolute_max_height_mm": 2900.0,
+        "max_speed_mm_s": 1200.0,
+        "sensor_timeout_s": 0.1,
+        "control_loop_timeout_s": 0.1,
+        "current_multiplier": 1.5,
+        "current_duration_s": 0.2,
+        "direction_tolerance_mm": 1.0,
+        "survey_max_on_s": 1.0,
+        "survey_pause_s": 0.5,
+    }
 
 
 def valid_config() -> dict[str, object]:
@@ -38,7 +55,7 @@ def valid_config() -> dict[str, object]:
             "startup_nmt_s": 5.0,
             "shutdown_zero_frames": 3,
         },
-        "control": {},
+        "control": valid_control_config(),
         "storage": {},
     }
 
@@ -68,6 +85,21 @@ def test_load_config_returns_typed_can_settings(tmp_path) -> None:
     assert config.can.shutdown_zero_frames == 3
 
 
+def test_load_config_returns_strict_typed_control_settings(tmp_path) -> None:
+    config = load_config(write_config(tmp_path, valid_config()))
+
+    assert isinstance(config.control, ControlConfig)
+    assert config.control.tolerance_mm == 2.0
+    assert config.control.absolute_max_height_mm == 2900.0
+
+
+def test_example_config_declares_safe_control_defaults() -> None:
+    with open("config/example.json", encoding="utf-8") as stream:
+        example = json.load(stream)
+
+    assert example["control"] == valid_control_config()
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -92,6 +124,11 @@ def test_load_config_returns_typed_can_settings(tmp_path) -> None:
         lambda data: data["can"].update({"preflight_s": -1}),
         lambda data: data["can"].update({"startup_nmt_s": float("nan")}),
         lambda data: data["can"].update({"shutdown_zero_frames": 2}),
+        lambda data: data["control"].update({"absolute_max_height_mm": 2900.1}),
+        lambda data: data["control"].update({"max_speed_mm_s": True}),
+        lambda data: data["control"].update({"sensor_timeout_s": float("nan")}),
+        lambda data: data["control"].update({"current_multiplier": 1.0}),
+        lambda data: data["control"].update({"survey_pause_s": 0}),
     ],
 )
 def test_load_config_rejects_missing_or_invalid_values(tmp_path, mutate) -> None:
@@ -116,6 +153,7 @@ def test_load_config_rejects_malformed_json(tmp_path) -> None:
         (lambda data: data.update({"unexpected_root": {}}), "unexpected_root"),
         (lambda data: data["sensor"].update({"slaev_id": 3}), "slaev_id"),
         (lambda data: data["can"].update({"bitrtae": 500000}), "bitrtae"),
+        (lambda data: data["control"].update({"tolernace_mm": 2}), "tolernace_mm"),
     ],
 )
 def test_load_config_rejects_unknown_fields_with_field_name(tmp_path, mutate, field_name: str) -> None:
@@ -174,3 +212,40 @@ def test_can_config_rejects_invalid_direct_construction(field: str, value: objec
     assert hasattr(package, "CanConfig")
     with pytest.raises(ConfigError, match=field):
         package.CanConfig(**can)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tolerance_mm", 0),
+        ("stable_time_s", True),
+        ("overshoot_limit_mm", float("inf")),
+        ("absolute_max_height_mm", 2901),
+        ("max_speed_mm_s", -1),
+        ("sensor_timeout_s", 0),
+        ("control_loop_timeout_s", 0),
+        ("current_multiplier", 1.0),
+        ("current_duration_s", 0),
+        ("direction_tolerance_mm", 0),
+        ("survey_max_on_s", 0),
+        ("survey_pause_s", 0),
+        ("tolerance_mm", 2.001),
+        ("stable_time_s", 0.499),
+        ("overshoot_limit_mm", 5.001),
+        ("max_speed_mm_s", 1200.001),
+        ("sensor_timeout_s", 0.1001),
+        ("control_loop_timeout_s", 0.1001),
+        ("current_multiplier", 1.5001),
+        ("current_duration_s", 0.2001),
+        ("direction_tolerance_mm", 2.001),
+        ("survey_max_on_s", 1.001),
+    ],
+)
+def test_control_config_rejects_invalid_direct_construction(
+    field: str, value: object
+) -> None:
+    control = valid_control_config()
+    control[field] = value
+
+    with pytest.raises(ConfigError, match=field):
+        ControlConfig(**control)  # type: ignore[arg-type]
