@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from agv_lift_height_control import ConfigError, load_config
+from agv_lift_height_control import ConfigError, SensorConfig, load_config
 
 
 def valid_config() -> dict[str, object]:
@@ -72,3 +72,38 @@ def test_load_config_rejects_malformed_json(tmp_path) -> None:
 
     with pytest.raises(ConfigError, match="JSON"):
         load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "field_name"),
+    [
+        (lambda data: data.update({"unexpected_root": {}}), "unexpected_root"),
+        (lambda data: data["sensor"].update({"slaev_id": 3}), "slaev_id"),
+    ],
+)
+def test_load_config_rejects_unknown_fields_with_field_name(tmp_path, mutate, field_name: str) -> None:
+    data = valid_config()
+    mutate(data)
+
+    with pytest.raises(ConfigError, match=field_name):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("transport", "tcp"),
+        ("port", ""),
+        ("register_count", 3),
+        ("word_order", "middle"),
+        ("counts_per_revolution", True),
+        ("timeout_s", float("inf")),
+    ],
+)
+def test_sensor_config_rejects_invalid_direct_construction(field: str, value: object) -> None:
+    sensor = valid_config()["sensor"]
+    assert isinstance(sensor, dict)
+    sensor[field] = value
+
+    with pytest.raises(ConfigError, match=field):
+        SensorConfig(**sensor)  # type: ignore[arg-type]

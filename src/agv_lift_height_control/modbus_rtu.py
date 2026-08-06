@@ -26,6 +26,7 @@ class ModbusRtuHeightSource:
         self._clock = clock
         self._client: Any | None = None
         self._connected = False
+        self._unit_parameter: str | None = None
 
     def open(self) -> bool:
         """创建并连接串口客户端；失败由返回值表示，便于上层决定重试策略。"""
@@ -44,12 +45,15 @@ class ModbusRtuHeightSource:
             if not client.connect():
                 self._close_client(client)
                 return False
+            unit_parameter = self._detect_unit_parameter(client.read_holding_registers)
             self._client = client
+            self._unit_parameter = unit_parameter
             self._connected = True
         except Exception:
             self._close_client(client)
             self._client = None
             self._connected = False
+            self._unit_parameter = None
         return self._connected
 
     def read_sample(self) -> HeightSample:
@@ -60,6 +64,7 @@ class ModbusRtuHeightSource:
         try:
             response = self._read_holding_registers()
         except Exception as exc:
+            self.close()
             return self._invalid(timestamp, f"Modbus RTU 读取失败: {exc}")
         if response is None:
             return self._invalid(timestamp, "Modbus RTU 响应为空")
@@ -93,25 +98,31 @@ class ModbusRtuHeightSource:
         """幂等关闭连接；本模块从不写入传感器零点、模式或任何寄存器。"""
         client, self._client = self._client, None
         self._connected = False
+        self._unit_parameter = None
         self._close_client(client)
 
     def _read_holding_registers(self) -> Any:
-        """按实际 pymodbus 版本签名选择站号参数，且只调用一次底层方法。"""
+        """使用打开连接时缓存的站号参数，只调用一次底层读方法。"""
         assert self._client is not None
+        assert self._unit_parameter is not None
         method = self._client.read_holding_registers
-        parameters = signature(method).parameters
         arguments = {
             "address": self._config.register_address,
             "count": self._config.register_count,
         }
-        # pymodbus 新版使用 device_id，旧版 3.x 使用 slave；签名判别避免误吞设备内部 TypeError。
-        if "device_id" in parameters:
-            arguments["device_id"] = self._config.slave_id
-        elif "slave" in parameters:
-            arguments["slave"] = self._config.slave_id
-        else:
-            raise TypeError("read_holding_registers 缺少 device_id 或 slave 参数")
+        arguments[self._unit_parameter] = self._config.slave_id
         return method(**arguments)
+
+    @staticmethod
+    def _detect_unit_parameter(method: Callable[..., Any]) -> str:
+        """打开连接后解析一次 pymodbus 签名，兼容新版 device_id 与旧版 slave。"""
+        parameters = signature(method).parameters
+        # 只依据签名决定参数名，不捕获 TypeError 后重试，以保留底层通信异常语义。
+        if "device_id" in parameters:
+            return "device_id"
+        if "slave" in parameters:
+            return "slave"
+        raise TypeError("read_holding_registers 缺少 device_id 或 slave 参数")
 
     @staticmethod
     def _close_client(client: Any | None) -> None:

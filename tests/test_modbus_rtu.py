@@ -1,3 +1,6 @@
+import inspect
+
+import agv_lift_height_control.modbus_rtu as rtu_module
 from agv_lift_height_control import ModbusRtuHeightSource, SensorConfig
 
 
@@ -39,6 +42,30 @@ class FakeDeviceIdClient(FakeClient):
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
+
+
+class ClientFactory:
+    def __init__(self, *clients: FakeClient) -> None:
+        self._clients = list(clients)
+        self.calls = 0
+
+    def __call__(self, **_):
+        self.calls += 1
+        return self._clients.pop(0)
+
+
+class SensorConfigProbe:
+    def __init__(self, config: SensorConfig) -> None:
+        self._config = config
+        self.register_count_reads = 0
+
+    @property
+    def register_count(self) -> int:
+        self.register_count_reads += 1
+        return self._config.register_count
+
+    def __getattr__(self, name: str):
+        return getattr(self._config, name)
 
 
 def sensor_config(**changes) -> SensorConfig:
@@ -109,10 +136,11 @@ def test_read_sample_uses_device_id_for_newer_pymodbus_signature() -> None:
     assert client.calls == [{"address": 12, "count": 2, "device_id": 9}]
 
 
-def test_read_sample_passes_register_count_from_config_to_client() -> None:
+def test_read_sample_reads_register_count_from_config_object() -> None:
     client = FakeClient(response=FakeResponse([0x0000, 0x0000]))
+    config = SensorConfigProbe(sensor_config())
     source = ModbusRtuHeightSource(
-        sensor_config(register_count=3),
+        config,  # type: ignore[arg-type]
         client_factory=lambda **_: client,
         clock=lambda: 1.0,
     )
@@ -120,7 +148,8 @@ def test_read_sample_passes_register_count_from_config_to_client() -> None:
 
     source.read_sample()
 
-    assert client.calls == [{"address": 0, "count": 3, "slave": 3}]
+    assert config.register_count_reads == 1
+    assert client.calls == [{"address": 0, "count": 2, "slave": 3}]
 
 
 def test_read_sample_returns_invalid_samples_for_error_and_bad_responses() -> None:
@@ -182,6 +211,39 @@ def test_open_connection_failure_closes_created_client() -> None:
 
     assert source.open() is False
     assert client.closed == 1
+
+
+def test_read_exception_closes_client_and_allows_open_to_reconnect() -> None:
+    failed_client = FakeClient(response=RuntimeError("serial down"))
+    recovered_client = FakeClient(response=FakeResponse([0, 0]))
+    factory = ClientFactory(failed_client, recovered_client)
+    source = ModbusRtuHeightSource(sensor_config(), client_factory=factory, clock=lambda: 5.0)
+
+    assert source.open() is True
+    assert source.read_sample().valid is False
+    assert failed_client.closed == 1
+
+    assert source.open() is True
+    assert factory.calls == 2
+    assert source.read_sample().valid is True
+
+
+def test_open_caches_unit_parameter_signature_for_multiple_samples(monkeypatch) -> None:
+    client = FakeDeviceIdClient(response=FakeResponse([0, 0]))
+    calls = 0
+
+    def tracked_signature(method):
+        nonlocal calls
+        calls += 1
+        return inspect.signature(method)
+
+    monkeypatch.setattr(rtu_module, "signature", tracked_signature)
+    source = ModbusRtuHeightSource(sensor_config(), client_factory=lambda **_: client, clock=lambda: 1.0)
+
+    assert source.open() is True
+    assert source.read_sample().valid is True
+    assert source.read_sample().valid is True
+    assert calls == 1
 
 
 def test_close_is_idempotent() -> None:

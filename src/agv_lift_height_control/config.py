@@ -29,6 +29,28 @@ class SensorConfig:
     range_mm: float
     poll_period_s: float
 
+    def __post_init__(self) -> None:
+        """直接构造配置时也保留与 JSON 加载相同的生产约束。"""
+        if type(self.transport) is not str or self.transport != "rtu":
+            raise ConfigError("sensor.transport 在 v1 必须是 'rtu'")
+        if type(self.port) is not str or not self.port:
+            raise ConfigError("sensor.port 必须是非空字符串")
+        if type(self.parity) is not str or self.parity not in {"N", "E", "O", "M", "S"}:
+            raise ConfigError("sensor.parity 必须是 N/E/O/M/S")
+        if type(self.word_order) is not str or self.word_order not in {"high_low", "low_high"}:
+            raise ConfigError("sensor.word_order 必须是 high_low 或 low_high")
+        _validate_integer_value("baudrate", self.baudrate, 1)
+        _validate_integer_value("bytesize", self.bytesize, 5, 8)
+        _validate_integer_value("stopbits", self.stopbits, 1, 2)
+        _validate_integer_value("slave_id", self.slave_id, 1, 247)
+        _validate_integer_value("register_address", self.register_address, 0, 65534)
+        _validate_integer_value("register_count", self.register_count, 2, 2)
+        _validate_integer_value("counts_per_revolution", self.counts_per_revolution, 1)
+        _validate_number_value("timeout_s", self.timeout_s)
+        _validate_number_value("wheel_circumference_mm", self.wheel_circumference_mm)
+        _validate_number_value("range_mm", self.range_mm)
+        _validate_number_value("poll_period_s", self.poll_period_s)
+
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -36,6 +58,10 @@ class AppConfig:
     can: dict[str, Any]
     control: dict[str, Any]
     storage: dict[str, Any]
+
+
+ROOT_FIELDS = frozenset({"sensor", "can", "control", "storage"})
+SENSOR_FIELDS = frozenset(SensorConfig.__dataclass_fields__)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -46,6 +72,7 @@ def load_config(path: str | Path) -> AppConfig:
         raise ConfigError(f"无法读取 JSON 配置: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("配置根节点必须是对象")
+    _reject_unknown_fields(raw, ROOT_FIELDS, "根配置")
 
     sections: dict[str, dict[str, Any]] = {}
     for section in ("sensor", "can", "control", "storage"):
@@ -62,6 +89,7 @@ def load_config(path: str | Path) -> AppConfig:
 
 
 def _parse_sensor(data: dict[str, Any]) -> SensorConfig:
+    _reject_unknown_fields(data, SENSOR_FIELDS, "sensor 配置")
     transport = _string(data, "transport")
     if transport != "rtu":
         raise ConfigError("v1 仅支持 sensor.transport='rtu'")
@@ -115,6 +143,21 @@ def _string(data: dict[str, Any], name: str) -> str:
 
 def _integer(data: dict[str, Any], name: str, minimum: int, maximum: int | None = None) -> int:
     value = data.get(name)
+    return _validate_integer_value(name, value, minimum, maximum)
+
+
+def _number(data: dict[str, Any], name: str, *, positive: bool) -> float:
+    value = data.get(name)
+    return _validate_number_value(name, value, positive=positive)
+
+
+def _reject_unknown_fields(data: dict[str, Any], allowed: frozenset[str], context: str) -> None:
+    unknown = sorted(set(data).difference(allowed))
+    if unknown:
+        raise ConfigError(f"{context} 包含未知字段: {', '.join(unknown)}")
+
+
+def _validate_integer_value(name: str, value: object, minimum: int, maximum: int | None = None) -> int:
     if type(value) is not int:
         raise ConfigError(f"sensor.{name} 必须是整数")
     if value < minimum or (maximum is not None and value > maximum):
@@ -122,8 +165,7 @@ def _integer(data: dict[str, Any], name: str, minimum: int, maximum: int | None 
     return value
 
 
-def _number(data: dict[str, Any], name: str, *, positive: bool) -> float:
-    value = data.get(name)
+def _validate_number_value(name: str, value: object, *, positive: bool = True) -> float:
     if type(value) not in {int, float}:
         raise ConfigError(f"sensor.{name} 必须是数字")
     result = float(value)
