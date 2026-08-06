@@ -33,6 +33,14 @@ class FakeClient:
         self.connected = False
 
 
+class FakeDeviceIdClient(FakeClient):
+    def read_holding_registers(self, *, address: int, count: int, device_id: int):
+        self.calls.append({"address": address, "count": count, "device_id": device_id})
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
 def sensor_config(**changes) -> SensorConfig:
     data = {
         "transport": "rtu",
@@ -86,6 +94,35 @@ def test_read_sample_supports_low_high_word_order_and_configured_modbus_target()
     assert client.calls == [{"address": 12, "count": 2, "slave": 9}]
 
 
+def test_read_sample_uses_device_id_for_newer_pymodbus_signature() -> None:
+    client = FakeDeviceIdClient(response=FakeResponse([0x0000, 0x0800]))
+    source = ModbusRtuHeightSource(
+        sensor_config(register_address=12, slave_id=9),
+        client_factory=lambda **_: client,
+        clock=lambda: 1.0,
+    )
+    source.open()
+
+    sample = source.read_sample()
+
+    assert sample.valid is True
+    assert client.calls == [{"address": 12, "count": 2, "device_id": 9}]
+
+
+def test_read_sample_passes_register_count_from_config_to_client() -> None:
+    client = FakeClient(response=FakeResponse([0x0000, 0x0000]))
+    source = ModbusRtuHeightSource(
+        sensor_config(register_count=3),
+        client_factory=lambda **_: client,
+        clock=lambda: 1.0,
+    )
+    source.open()
+
+    source.read_sample()
+
+    assert client.calls == [{"address": 0, "count": 3, "slave": 3}]
+
+
 def test_read_sample_returns_invalid_samples_for_error_and_bad_responses() -> None:
     cases = [
         FakeResponse(error=True),
@@ -137,6 +174,14 @@ def test_open_connection_failure_and_read_before_open_are_safe() -> None:
     assert source.read_sample().valid is False
     assert source.open() is False
     assert source.read_sample().valid is False
+
+
+def test_open_connection_failure_closes_created_client() -> None:
+    client = FakeClient(connect_result=False, response=FakeResponse([0, 0]))
+    source = ModbusRtuHeightSource(sensor_config(), client_factory=lambda **_: client)
+
+    assert source.open() is False
+    assert client.closed == 1
 
 
 def test_close_is_idempotent() -> None:

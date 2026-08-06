@@ -1,6 +1,7 @@
 """只读 Modbus RTU 编码器高度源。"""
 
 from collections.abc import Callable
+from inspect import signature
 from time import monotonic
 from typing import Any
 
@@ -30,8 +31,9 @@ class ModbusRtuHeightSource:
         """创建并连接串口客户端；失败由返回值表示，便于上层决定重试策略。"""
         if self._connected:
             return True
+        client: Any | None = None
         try:
-            self._client = self._client_factory(
+            client = self._client_factory(
                 port=self._config.port,
                 baudrate=self._config.baudrate,
                 bytesize=self._config.bytesize,
@@ -39,8 +41,13 @@ class ModbusRtuHeightSource:
                 stopbits=self._config.stopbits,
                 timeout=self._config.timeout_s,
             )
-            self._connected = bool(self._client.connect())
+            if not client.connect():
+                self._close_client(client)
+                return False
+            self._client = client
+            self._connected = True
         except Exception:
+            self._close_client(client)
             self._client = None
             self._connected = False
         return self._connected
@@ -51,11 +58,7 @@ class ModbusRtuHeightSource:
         if not self._connected or self._client is None:
             return self._invalid(timestamp, "Modbus RTU 未连接")
         try:
-            response = self._client.read_holding_registers(
-                address=self._config.register_address,
-                count=2,
-                slave=self._config.slave_id,
-            )
+            response = self._read_holding_registers()
         except Exception as exc:
             return self._invalid(timestamp, f"Modbus RTU 读取失败: {exc}")
         if response is None:
@@ -89,8 +92,30 @@ class ModbusRtuHeightSource:
     def close(self) -> None:
         """幂等关闭连接；本模块从不写入传感器零点、模式或任何寄存器。"""
         client, self._client = self._client, None
-        was_connected, self._connected = self._connected, False
-        if client is not None and was_connected:
+        self._connected = False
+        self._close_client(client)
+
+    def _read_holding_registers(self) -> Any:
+        """按实际 pymodbus 版本签名选择站号参数，且只调用一次底层方法。"""
+        assert self._client is not None
+        method = self._client.read_holding_registers
+        parameters = signature(method).parameters
+        arguments = {
+            "address": self._config.register_address,
+            "count": self._config.register_count,
+        }
+        # pymodbus 新版使用 device_id，旧版 3.x 使用 slave；签名判别避免误吞设备内部 TypeError。
+        if "device_id" in parameters:
+            arguments["device_id"] = self._config.slave_id
+        elif "slave" in parameters:
+            arguments["slave"] = self._config.slave_id
+        else:
+            raise TypeError("read_holding_registers 缺少 device_id 或 slave 参数")
+        return method(**arguments)
+
+    @staticmethod
+    def _close_client(client: Any | None) -> None:
+        if client is not None:
             try:
                 client.close()
             except Exception:
