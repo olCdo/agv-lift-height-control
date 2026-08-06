@@ -225,6 +225,55 @@ class ControlledSleeper:
         self.release.wait(1.0)
 
 
+class IndefiniteSleeper:
+    """阻塞发送线程，直到测试显式放行，用于稳定复现 join 超时。"""
+
+    def __init__(self) -> None:
+        self.entered = Event()
+        self.release = Event()
+
+    def __call__(self, _seconds: float) -> None:
+        self.entered.set()
+        self.release.wait()
+
+
+class SequenceBusFactory:
+    def __init__(self, *buses: FakeBus) -> None:
+        self.buses = deque(buses)
+        self.calls: list[str] = []
+
+    def __call__(self, interface: str) -> FakeBus:
+        self.calls.append(interface)
+        return self.buses.popleft()
+
+
+class BlockingFailureCleanupBus(FakeBus):
+    """让接收线程在故障清理的零帧发送中停住，以暴露跨代启动竞态。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.trigger_failure = Event()
+        self.cleanup_entered = Event()
+        self.release_cleanup = Event()
+        self.block_cleanup = False
+
+    def recv(self, timeout: float) -> object | None:
+        if current_thread().name == "MainThread":
+            return super().recv(timeout)
+        self.trigger_failure.wait()
+        raise OSError("simulated receive failure during cleanup")
+
+    def send(self, message: FakeMessage, timeout: float | None = None) -> None:
+        if (
+            self.block_cleanup
+            and current_thread().name == "can-pump-receive"
+            and message.arbitration_id == 0x217
+        ):
+            self.cleanup_entered.set()
+            self.release_cleanup.wait()
+        super().send(message, timeout=timeout)
+
+
 def make_pump(
     bus: FakeBus,
     *,
@@ -402,6 +451,59 @@ def test_safe_policy_fails_closed(changes: dict[str, object], reason_fragment: s
     assert reason_fragment in (reason or "")
 
 
+INVALID_SAFETY_TIMESTAMPS = [
+    pytest.param(float("nan"), id="nan"),
+    pytest.param(float("inf"), id="positive-infinity"),
+    pytest.param(float("-inf"), id="negative-infinity"),
+    pytest.param(-0.001, id="negative"),
+    pytest.param("10.0", id="wrong-type"),
+    pytest.param(True, id="bool"),
+]
+
+
+def assert_invalid_safety_timestamp_fails_closed(
+    *,
+    changes: dict[str, object],
+    reason_fragment: str,
+) -> None:
+    try:
+        command, reason = safe_selection(**changes)
+    except Exception as exc:  # pragma: no cover - 失败输出需要显示原始异常
+        pytest.fail(f"非法时间戳必须安全停机，不得抛出算术异常: {exc!r}")
+    assert command == PumpCommand.safe_stop()
+    assert reason_fragment in (reason or "")
+
+
+@pytest.mark.parametrize("invalid_timestamp", INVALID_SAFETY_TIMESTAMPS)
+def test_safe_policy_rejects_invalid_started_at_before_arithmetic(
+    invalid_timestamp: object,
+) -> None:
+    assert_invalid_safety_timestamp_fails_closed(
+        changes={"started_at": invalid_timestamp},
+        reason_fragment="启动时间",
+    )
+
+
+@pytest.mark.parametrize("invalid_timestamp", INVALID_SAFETY_TIMESTAMPS)
+def test_safe_policy_rejects_invalid_desired_updated_at_before_arithmetic(
+    invalid_timestamp: object,
+) -> None:
+    assert_invalid_safety_timestamp_fails_closed(
+        changes={"desired_updated_at": invalid_timestamp},
+        reason_fragment="命令时间",
+    )
+
+
+@pytest.mark.parametrize("invalid_timestamp", INVALID_SAFETY_TIMESTAMPS)
+def test_safe_policy_rejects_invalid_feedback_timestamp_before_arithmetic(
+    invalid_timestamp: object,
+) -> None:
+    assert_invalid_safety_timestamp_fails_closed(
+        changes={"feedback": PumpFeedback(invalid_timestamp, 100, 0, 20)},  # type: ignore[arg-type]
+        reason_fragment="反馈时间",
+    )
+
+
 def test_start_preflight_rejects_other_standard_command_without_sending() -> None:
     bus = FakeBus(preflight=[FakeMessage(0x217, bytes(8))])
     pump, _, _ = make_pump(bus)
@@ -554,6 +656,182 @@ def test_thread_construction_failure_rolls_back_all_started_state(
     assert all(bytes(frame.data) == bytes(8) for frame in bus.send_attempts[-3:])
 
 
+def install_non_waiting_join_threads(monkeypatch) -> list[object]:
+    """运行真实线程，但让 join 立即返回，避免超时测试真实等待一秒。"""
+
+    instances: list[object] = []
+
+    class NonWaitingJoinThread:
+        def __init__(self, *, target, name: str, daemon: bool) -> None:
+            self._thread = WorkerThread(target=target, name=name, daemon=daemon)
+            instances.append(self)
+
+        def start(self) -> None:
+            self._thread.start()
+
+        def join(self, timeout: float | None = None) -> None:
+            self._thread.join(timeout=0)
+
+        def is_alive(self) -> bool:
+            return self._thread.is_alive()
+
+    monkeypatch.setattr(can_module, "Thread", NonWaitingJoinThread)
+    return instances
+
+
+def test_stop_join_timeout_retains_old_thread_and_rejects_restart_before_bus_open(
+    monkeypatch,
+) -> None:
+    threads = install_non_waiting_join_threads(monkeypatch)
+    old_bus = FakeBus()
+    unused_new_bus = FakeBus()
+    bus_factory = SequenceBusFactory(old_bus, unused_new_bus)
+    link_checks: list[tuple[str, int]] = []
+    sleeper = IndefiniteSleeper()
+    pump = api("CanPump")(
+        can_config(),
+        bus_factory=bus_factory,
+        message_factory=message_factory,
+        clock=ManualClock(),
+        sleeper=sleeper,
+        link_checker=lambda interface, bitrate: link_checks.append((interface, bitrate)),
+    )
+
+    pump.start()
+    assert sleeper.entered.wait(0.5)
+    old_send_thread = pump._send_thread
+    pump.stop()
+
+    try:
+        assert old_send_thread is not None and old_send_thread.is_alive()
+        assert pump._send_thread is old_send_thread
+        assert pump._stop_event.is_set()
+        assert "未退出" in (pump.fault_reason or "")
+        with pytest.raises(api("CanPumpError"), match="线程.*未退出"):
+            pump.start()
+        assert bus_factory.calls == ["can0"]
+        assert link_checks == [("can0", 500000)]
+        assert unused_new_bus.send_attempts == []
+        assert unused_new_bus.shutdown_calls == 0
+        assert pump._stop_event.is_set()
+    finally:
+        sleeper.release.set()
+        pump.stop()
+        wait_until(lambda: all(not thread.is_alive() for thread in threads))
+
+
+def test_restart_succeeds_after_retained_old_generation_exits() -> None:
+    old_bus = FakeBus()
+    new_bus = FakeBus()
+    bus_factory = SequenceBusFactory(old_bus, new_bus)
+    sleeper = IndefiniteSleeper()
+    pump = api("CanPump")(
+        can_config(),
+        bus_factory=bus_factory,
+        message_factory=message_factory,
+        clock=ManualClock(),
+        sleeper=sleeper,
+        link_checker=lambda _interface, _bitrate: None,
+    )
+
+    pump.start()
+    assert sleeper.entered.wait(0.5)
+    old_send_thread = pump._send_thread
+    old_receive_thread = pump._receive_thread
+    old_send_count = len(old_bus.send_attempts)
+    pump.stop()
+
+    try:
+        assert pump._send_thread is old_send_thread
+        sleeper.release.set()
+        wait_until(
+            lambda: (
+                old_send_thread is not None
+                and old_receive_thread is not None
+                and not old_send_thread.is_alive()
+                and not old_receive_thread.is_alive()
+            )
+        )
+
+        pump.start()
+
+        assert pump.is_running is True
+        assert pump._send_thread is not old_send_thread
+        assert pump._receive_thread is not old_receive_thread
+        assert bus_factory.calls == ["can0", "can0"]
+        assert len(old_bus.send_attempts) == old_send_count + 3
+        assert [(frame.arbitration_id, bytes(frame.data)) for frame in new_bus.sent[:2]] == [
+            (0x000, bytes([1, 0])),
+            (0x217, bytes(8)),
+        ]
+    finally:
+        sleeper.release.set()
+        pump.stop()
+
+
+def test_thread_liveness_helper_accepts_finished_test_double() -> None:
+    pump, _, _ = make_pump(FakeBus())
+
+    class FinishedThreadDouble:
+        pass
+
+    assert pump._thread_is_alive(None) is False
+    assert pump._thread_is_alive(FinishedThreadDouble()) is False
+
+
+def test_failure_cleanup_rejects_restart_before_new_bus_can_open() -> None:
+    old_bus = BlockingFailureCleanupBus()
+    unused_new_bus = FakeBus()
+    bus_factory = SequenceBusFactory(old_bus, unused_new_bus)
+    link_checks: list[tuple[str, int]] = []
+    sleeper = IndefiniteSleeper()
+    pump = api("CanPump")(
+        can_config(),
+        bus_factory=bus_factory,
+        message_factory=message_factory,
+        clock=ManualClock(),
+        sleeper=sleeper,
+        link_checker=lambda interface, bitrate: link_checks.append((interface, bitrate)),
+    )
+    pump.start()
+    assert sleeper.entered.wait(0.5)
+    old_bus.block_cleanup = True
+    old_bus.trigger_failure.set()
+    assert old_bus.cleanup_entered.wait(0.5)
+    wait_until(lambda: pump.is_running is False)
+
+    restart_result: list[BaseException | None] = []
+    restart_finished = Event()
+
+    def attempt_restart() -> None:
+        try:
+            pump.start()
+        except BaseException as exc:
+            restart_result.append(exc)
+        else:
+            restart_result.append(None)
+        finally:
+            restart_finished.set()
+
+    restart_thread = WorkerThread(target=attempt_restart)
+    restart_thread.start()
+    rejected_before_cleanup_release = restart_finished.wait(0.2)
+
+    try:
+        assert rejected_before_cleanup_release is True
+        assert restart_result and isinstance(restart_result[0], api("CanPumpError"))
+        assert "线程" in str(restart_result[0])
+        assert bus_factory.calls == ["can0"]
+        assert link_checks == [("can0", 500000)]
+        assert unused_new_bus.send_attempts == []
+        assert unused_new_bus.shutdown_calls == 0
+    finally:
+        old_bus.release_cleanup.set()
+        sleeper.release.set()
+        restart_thread.join(timeout=1.0)
+        pump.stop()
+
+
 def test_stop_racing_receive_failure_closes_and_zeroes_bus_only_once() -> None:
     bus = BlockingReceiveErrorBus()
     pump, _, sleeper = make_pump(bus)
@@ -657,7 +935,7 @@ def test_run_cycle_keeps_zero_during_five_second_window_then_allows_fresh_comman
     pump.stop()
 
 
-def test_fault_feedback_committed_before_send_prevents_old_nonzero_and_does_not_deadlock() -> None:
+def test_after_fault_feedback_state_commit_no_later_cycle_sends_nonzero() -> None:
     bus = FakeBus()
     clock = ManualClock()
     sleeper = ControlledSleeper(clock)
@@ -687,6 +965,7 @@ def test_fault_feedback_committed_before_send_prevents_old_nonzero_and_does_not_
             fault_committed_while_cycle_paused = True
             break
         Event().wait(0.001)
+    # 已持有发送周期锁的周期可以先完成；保证边界是“反馈状态提交之后”，不是物理帧到达瞬间。
     sent_count_at_commit = len(bus.sent) if fault_committed_while_cycle_paused else None
 
     factory.release.set()

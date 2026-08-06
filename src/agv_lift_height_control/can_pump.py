@@ -169,8 +169,14 @@ def select_safe_command(
 ) -> tuple[PumpCommand, str | None]:
     """纯策略函数：任一安全条件不满足就返回完整全零命令和可查询原因。"""
     safe_stop = PumpCommand.safe_stop()
-    if type(now) not in {int, float} or not isfinite(float(now)) or now < 0:
+    if not _is_valid_safety_timestamp(now):
         return safe_stop, "本机时钟值无效，强制全零"
+    if not _is_valid_safety_timestamp(started_at):
+        return safe_stop, "CAN 泵启动时间戳无效，强制全零"
+    if desired_updated_at is not None and not _is_valid_safety_timestamp(desired_updated_at):
+        return safe_stop, "泵命令时间戳无效，强制全零"
+    if feedback is not None and not _is_valid_safety_timestamp(feedback.timestamp):
+        return safe_stop, "CAN 泵反馈时间戳无效，强制全零"
     if thread_fault is not None:
         return safe_stop, thread_fault
     if now < started_at or now - started_at < config.startup_nmt_s:
@@ -192,6 +198,11 @@ def select_safe_command(
     if feedback.fault_code != 0:
         return safe_stop, f"CAN 泵反馈故障码 {feedback.fault_code}，强制全零"
     return desired, None
+
+
+def _is_valid_safety_timestamp(value: object) -> bool:
+    """安全策略时间戳只能是有限、非负的实数，且布尔值不得冒充整数。"""
+    return type(value) in {int, float} and isfinite(float(value)) and value >= 0
 
 
 class CanPump:
@@ -273,6 +284,28 @@ class CanPump:
         with self._lifecycle_lock:
             if self.is_running:
                 return
+            with self._state_lock:
+                previous_send_thread = self._send_thread
+                previous_receive_thread = self._receive_thread
+            live_thread_names = [
+                name
+                for name, thread in (
+                    ("发送线程", previous_send_thread),
+                    ("接收线程", previous_receive_thread),
+                )
+                if self._thread_is_alive(thread)
+            ]
+            if live_thread_names:
+                reason = f"CAN 后台线程仍未退出，拒绝重启: {', '.join(live_thread_names)}"
+                self._stop_event.set()
+                with self._state_lock:
+                    self._running = False
+                    self._fault_reason = reason
+                raise CanPumpError(reason)
+            if previous_send_thread is not None or previous_receive_thread is not None:
+                with self._state_lock:
+                    self._send_thread = None
+                    self._receive_thread = None
             try:
                 self._link_checker(self._config.interface, self._config.bitrate)
             except Exception as exc:
@@ -341,6 +374,8 @@ class CanPump:
                     self._fault_reason = reason
                 for thread in started_threads:
                     thread.join(timeout=1.0)
+                send_thread_alive = self._thread_is_alive(self._send_thread)
+                receive_thread_alive = self._thread_is_alive(self._receive_thread)
                 with self._cycle_lock:
                     self._send_shutdown_zero_frames(bus)
                     self._close_bus(bus)
@@ -348,8 +383,12 @@ class CanPump:
                         if self._bus is bus:
                             self._bus = None
                         self._started_at = None
-                        self._send_thread = None
-                        self._receive_thread = None
+                        if not send_thread_alive:
+                            self._send_thread = None
+                        if not receive_thread_alive:
+                            self._receive_thread = None
+                        if send_thread_alive or receive_thread_alive:
+                            self._fault_reason = f"{reason}；已有线程未退出"
                 raise CanPumpError(reason) from exc
             self._threads_ready.set()
 
@@ -407,6 +446,17 @@ class CanPump:
                 if thread is not None and thread is not current_thread():
                     thread.join(timeout=1.0)
 
+            send_thread_alive = self._thread_is_alive(send_thread)
+            receive_thread_alive = self._thread_is_alive(receive_thread)
+            live_thread_names = [
+                name
+                for name, is_alive in (
+                    ("发送线程", send_thread_alive),
+                    ("接收线程", receive_thread_alive),
+                )
+                if is_alive
+            ]
+
             # 线程故障可能在 join 期间已关闭总线，因此必须重新读取所有权，不能使用
             # stop 入口处的旧快照重复发送和 shutdown。
             with self._cycle_lock:
@@ -419,9 +469,13 @@ class CanPump:
                     if self._bus is bus:
                         self._bus = None
                     self._started_at = None
-                    self._send_thread = None
-                    self._receive_thread = None
-                    if self._thread_fault is None:
+                    self._send_thread = send_thread if send_thread_alive else None
+                    self._receive_thread = receive_thread if receive_thread_alive else None
+                    if live_thread_names:
+                        self._fault_reason = (
+                            "CAN 泵已停止，但后台线程未退出: " + ", ".join(live_thread_names)
+                        )
+                    elif self._thread_fault is None:
                         self._fault_reason = "CAN 泵已停止并切换为全零"
 
     def __enter__(self) -> "CanPump":
@@ -538,6 +592,20 @@ class CanPump:
                 self._send_payload(bus, self._config.command_id, payload)
             except Exception:
                 pass
+
+    @staticmethod
+    def _thread_is_alive(thread: object | None) -> bool:
+        """真实线程使用 is_alive；无该接口的轻量测试替身按已结束处理。"""
+        if thread is None:
+            return False
+        is_alive = getattr(thread, "is_alive", None)
+        if not callable(is_alive):
+            return False
+        try:
+            return bool(is_alive())
+        except Exception:
+            # 无法确认线程已结束时必须按仍存活处理，避免清停止事件导致跨代复活。
+            return True
 
     def _send_payload(self, bus: Any, arbitration_id: int, data: bytes) -> None:
         message = self._message_factory(
