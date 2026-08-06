@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+import agv_lift_height_control as package
 from agv_lift_height_control import ConfigError, SensorConfig, load_config
 
 
@@ -24,7 +25,19 @@ def valid_config() -> dict[str, object]:
             "range_mm": 3000.0,
             "poll_period_s": 0.02,
         },
-        "can": {},
+        "can": {
+            "interface": "can0",
+            "bitrate": 500000,
+            "command_id": 0x217,
+            "feedback_id": 0x197,
+            "nmt_id": 0,
+            "send_period_s": 0.05,
+            "feedback_timeout_s": 0.15,
+            "command_timeout_s": 0.15,
+            "preflight_s": 0.3,
+            "startup_nmt_s": 5.0,
+            "shutdown_zero_frames": 3,
+        },
         "control": {},
         "storage": {},
     }
@@ -44,6 +57,17 @@ def test_load_config_returns_typed_sensor_settings(tmp_path) -> None:
     assert config.sensor.counts_per_revolution == 4096
 
 
+def test_load_config_returns_typed_can_settings(tmp_path) -> None:
+    config = load_config(write_config(tmp_path, valid_config()))
+
+    assert hasattr(package, "CanConfig")
+    assert isinstance(config.can, package.CanConfig)
+    assert config.can.interface == "can0"
+    assert config.can.command_id == 0x217
+    assert config.can.feedback_id == 0x197
+    assert config.can.shutdown_zero_frames == 3
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -56,6 +80,16 @@ def test_load_config_returns_typed_sensor_settings(tmp_path) -> None:
         lambda data: data["sensor"].update({"register_address": 65535}),
         lambda data: data["sensor"].update({"counts_per_revolution": True}),
         lambda data: data["sensor"].update({"range_mm": -1}),
+        lambda data: data["can"].update({"bitrate": 250000}),
+        lambda data: data["can"].update({"command_id": 0x800}),
+        lambda data: data["can"].update({"feedback_id": 0x217}),
+        lambda data: data["can"].update({"nmt_id": 1}),
+        lambda data: data["can"].update({"send_period_s": 0}),
+        lambda data: data["can"].update({"feedback_timeout_s": 0.151}),
+        lambda data: data["can"].update({"command_timeout_s": 0.151}),
+        lambda data: data["can"].update({"preflight_s": -1}),
+        lambda data: data["can"].update({"startup_nmt_s": float("nan")}),
+        lambda data: data["can"].update({"shutdown_zero_frames": 2}),
     ],
 )
 def test_load_config_rejects_missing_or_invalid_values(tmp_path, mutate) -> None:
@@ -79,6 +113,7 @@ def test_load_config_rejects_malformed_json(tmp_path) -> None:
     [
         (lambda data: data.update({"unexpected_root": {}}), "unexpected_root"),
         (lambda data: data["sensor"].update({"slaev_id": 3}), "slaev_id"),
+        (lambda data: data["can"].update({"bitrtae": 500000}), "bitrtae"),
     ],
 )
 def test_load_config_rejects_unknown_fields_with_field_name(tmp_path, mutate, field_name: str) -> None:
@@ -107,3 +142,31 @@ def test_sensor_config_rejects_invalid_direct_construction(field: str, value: ob
 
     with pytest.raises(ConfigError, match=field):
         SensorConfig(**sensor)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("interface", ""),
+        ("interface", "接口接口接口"),
+        ("bitrate", True),
+        ("bitrate", 250000),
+        ("command_id", 0x197),
+        ("feedback_id", 0x217),
+        ("nmt_id", 1),
+        ("send_period_s", 0.2),
+        ("feedback_timeout_s", 0),
+        ("command_timeout_s", 0.151),
+        ("preflight_s", float("inf")),
+        ("startup_nmt_s", -1),
+        ("shutdown_zero_frames", 2),
+    ],
+)
+def test_can_config_rejects_invalid_direct_construction(field: str, value: object) -> None:
+    can = valid_config()["can"]
+    assert isinstance(can, dict)
+    can[field] = value
+
+    assert hasattr(package, "CanConfig")
+    with pytest.raises(ConfigError, match=field):
+        package.CanConfig(**can)

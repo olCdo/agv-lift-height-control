@@ -16,7 +16,19 @@
     "range_mm": 3000.0,
     "poll_period_s": 0.02
   },
-  "can": {},
+  "can": {
+    "interface": "can0",
+    "bitrate": 500000,
+    "command_id": 535,
+    "feedback_id": 407,
+    "nmt_id": 0,
+    "send_period_s": 0.05,
+    "feedback_timeout_s": 0.15,
+    "command_timeout_s": 0.15,
+    "preflight_s": 0.3,
+    "startup_nmt_s": 5.0,
+    "shutdown_zero_frames": 3
+  },
   "control": {},
   "storage": {}
 }

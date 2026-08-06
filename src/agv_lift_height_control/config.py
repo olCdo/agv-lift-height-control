@@ -53,15 +53,65 @@ class SensorConfig:
 
 
 @dataclass(frozen=True)
+class CanConfig:
+    """CAN 泵协议和失效保护时间参数，单位均为秒或 bit/s。"""
+
+    interface: str
+    bitrate: int
+    command_id: int
+    feedback_id: int
+    nmt_id: int
+    send_period_s: float
+    feedback_timeout_s: float
+    command_timeout_s: float
+    preflight_s: float
+    startup_nmt_s: float
+    shutdown_zero_frames: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.interface) is not str
+            or not self.interface
+            or len(self.interface.encode("utf-8")) > 15
+            or any(character.isspace() for character in self.interface)
+        ):
+            raise ConfigError("can.interface 必须是 1..15 字节且不含空白的接口名")
+        _validate_integer_value("bitrate", self.bitrate, 500000, 500000, section="can")
+        _validate_integer_value("command_id", self.command_id, 0, 0x7FF, section="can")
+        _validate_integer_value("feedback_id", self.feedback_id, 0, 0x7FF, section="can")
+        _validate_integer_value("nmt_id", self.nmt_id, 0, 0x7FF, section="can")
+        if self.command_id != 0x217:
+            raise ConfigError("can.command_id 必须是标准帧 ID 0x217")
+        if self.feedback_id != 0x197:
+            raise ConfigError("can.feedback_id 必须是标准帧 ID 0x197")
+        if self.nmt_id != 0:
+            raise ConfigError("can.nmt_id 必须是 CANopen NMT ID 0x000")
+        _validate_number_range("send_period_s", self.send_period_s, 0.001, 0.05)
+        _validate_number_range("feedback_timeout_s", self.feedback_timeout_s, 0.001, 0.15)
+        _validate_number_range("command_timeout_s", self.command_timeout_s, 0.001, 0.15)
+        # 这些下限保证配置不能缩短协议要求的冲突探测和 NMT 安全窗口。
+        _validate_number_range("preflight_s", self.preflight_s, 0.3, 10.0)
+        _validate_number_range("startup_nmt_s", self.startup_nmt_s, 5.0, 60.0)
+        _validate_integer_value(
+            "shutdown_zero_frames",
+            self.shutdown_zero_frames,
+            3,
+            100,
+            section="can",
+        )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     sensor: SensorConfig
-    can: dict[str, Any]
+    can: CanConfig
     control: dict[str, Any]
     storage: dict[str, Any]
 
 
 ROOT_FIELDS = frozenset({"sensor", "can", "control", "storage"})
 SENSOR_FIELDS = frozenset(SensorConfig.__dataclass_fields__)
+CAN_FIELDS = frozenset(CanConfig.__dataclass_fields__)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -82,7 +132,7 @@ def load_config(path: str | Path) -> AppConfig:
         sections[section] = value
     return AppConfig(
         sensor=_parse_sensor(sections["sensor"]),
-        can=sections["can"],
+        can=_parse_can(sections["can"]),
         control=sections["control"],
         storage=sections["storage"],
     )
@@ -134,21 +184,46 @@ def _parse_sensor(data: dict[str, Any]) -> SensorConfig:
     )
 
 
-def _string(data: dict[str, Any], name: str) -> str:
+def _parse_can(data: dict[str, Any]) -> CanConfig:
+    """逐字段读取 CAN 配置，使缺失字段也统一转换为可操作的 ConfigError。"""
+    _reject_unknown_fields(data, CAN_FIELDS, "can 配置")
+    return CanConfig(
+        interface=_string(data, "interface", section="can"),
+        bitrate=_integer(data, "bitrate", 0, 0x7FFFFFFF, section="can"),
+        command_id=_integer(data, "command_id", 0, 0x7FF, section="can"),
+        feedback_id=_integer(data, "feedback_id", 0, 0x7FF, section="can"),
+        nmt_id=_integer(data, "nmt_id", 0, 0x7FF, section="can"),
+        send_period_s=_number(data, "send_period_s", positive=True, section="can"),
+        feedback_timeout_s=_number(data, "feedback_timeout_s", positive=True, section="can"),
+        command_timeout_s=_number(data, "command_timeout_s", positive=True, section="can"),
+        preflight_s=_number(data, "preflight_s", positive=True, section="can"),
+        startup_nmt_s=_number(data, "startup_nmt_s", positive=True, section="can"),
+        shutdown_zero_frames=_integer(data, "shutdown_zero_frames", 0, 100, section="can"),
+    )
+
+
+def _string(data: dict[str, Any], name: str, *, section: str = "sensor") -> str:
     value = data.get(name)
     if not isinstance(value, str):
-        raise ConfigError(f"sensor.{name} 必须是字符串")
+        raise ConfigError(f"{section}.{name} 必须是字符串")
     return value
 
 
-def _integer(data: dict[str, Any], name: str, minimum: int, maximum: int | None = None) -> int:
+def _integer(
+    data: dict[str, Any],
+    name: str,
+    minimum: int,
+    maximum: int | None = None,
+    *,
+    section: str = "sensor",
+) -> int:
     value = data.get(name)
-    return _validate_integer_value(name, value, minimum, maximum)
+    return _validate_integer_value(name, value, minimum, maximum, section=section)
 
 
-def _number(data: dict[str, Any], name: str, *, positive: bool) -> float:
+def _number(data: dict[str, Any], name: str, *, positive: bool, section: str = "sensor") -> float:
     value = data.get(name)
-    return _validate_number_value(name, value, positive=positive)
+    return _validate_number_value(name, value, positive=positive, section=section)
 
 
 def _reject_unknown_fields(data: dict[str, Any], allowed: frozenset[str], context: str) -> None:
@@ -157,18 +232,38 @@ def _reject_unknown_fields(data: dict[str, Any], allowed: frozenset[str], contex
         raise ConfigError(f"{context} 包含未知字段: {', '.join(unknown)}")
 
 
-def _validate_integer_value(name: str, value: object, minimum: int, maximum: int | None = None) -> int:
+def _validate_integer_value(
+    name: str,
+    value: object,
+    minimum: int,
+    maximum: int | None = None,
+    *,
+    section: str = "sensor",
+) -> int:
     if type(value) is not int:
-        raise ConfigError(f"sensor.{name} 必须是整数")
+        raise ConfigError(f"{section}.{name} 必须是整数")
     if value < minimum or (maximum is not None and value > maximum):
-        raise ConfigError(f"sensor.{name} 超出允许范围")
+        raise ConfigError(f"{section}.{name} 超出允许范围")
     return value
 
 
-def _validate_number_value(name: str, value: object, *, positive: bool = True) -> float:
+def _validate_number_value(
+    name: str,
+    value: object,
+    *,
+    positive: bool = True,
+    section: str = "sensor",
+) -> float:
     if type(value) not in {int, float}:
-        raise ConfigError(f"sensor.{name} 必须是数字")
+        raise ConfigError(f"{section}.{name} 必须是数字")
     result = float(value)
     if not isfinite(result) or (positive and result <= 0):
-        raise ConfigError(f"sensor.{name} 必须大于零")
+        raise ConfigError(f"{section}.{name} 必须大于零")
+    return result
+
+
+def _validate_number_range(name: str, value: object, minimum: float, maximum: float) -> float:
+    result = _validate_number_value(name, value, section="can")
+    if not minimum <= result <= maximum:
+        raise ConfigError(f"can.{name} 超出允许范围 {minimum}..{maximum}")
     return result
