@@ -86,7 +86,7 @@ class CanConfig:
             raise ConfigError("can.feedback_id 必须是标准帧 ID 0x197")
         if self.nmt_id != 0:
             raise ConfigError("can.nmt_id 必须是 CANopen NMT ID 0x000")
-        _validate_number_range("send_period_s", self.send_period_s, 0.001, 0.05)
+        _validate_number_range("send_period_s", self.send_period_s, 0.05, 0.05)
         _validate_number_range("feedback_timeout_s", self.feedback_timeout_s, 0.001, 0.15)
         _validate_number_range("command_timeout_s", self.command_timeout_s, 0.001, 0.15)
         # 这些下限保证配置不能缩短协议要求的冲突探测和 NMT 安全窗口。

@@ -128,15 +128,14 @@ def parse_pump_feedback(
     frame: Any,
     *,
     timestamp: float,
-    expected_id: int = 0x197,
 ) -> PumpFeedback:
     """解析标准数据帧 0x197，并使用本机单调时钟标记接收时刻。"""
     if type(timestamp) not in {int, float} or not isfinite(float(timestamp)) or timestamp < 0:
         raise ValueError("timestamp 必须是有限且非负的本机单调时钟值")
     if type(getattr(frame, "arbitration_id", None)) is not int:
         raise ValueError("反馈帧 arbitration_id 无效")
-    if frame.arbitration_id != expected_id:
-        raise ValueError(f"反馈帧 ID 必须是 0x{expected_id:03X}")
+    if frame.arbitration_id != 0x197:
+        raise ValueError("反馈帧 ID 必须是固定协议值 0x197")
     if getattr(frame, "is_extended_id", None) is not False:
         raise ValueError("反馈必须是标准帧，不能是扩展帧")
     if getattr(frame, "is_remote_frame", None) is not False:
@@ -224,6 +223,8 @@ class CanPump:
         self._lifecycle_lock = Lock()
         self._send_lock = Lock()
         self._cycle_lock = Lock()
+        # 锁序约束：同时需要周期状态和共享状态时，始终先 cycle、后 state；
+        # 工作线程不获取 lifecycle，避免 stop join 与故障清理互相等待。
         self._stop_event = Event()
         self._threads_ready = Event()
         self._bus: Any | None = None
@@ -316,10 +317,16 @@ class CanPump:
                 self._handle_thread_failure("启动发送", exc)
                 raise CanPumpError(f"CAN 泵启动发送失败: {exc}") from exc
 
-            self._send_thread = Thread(target=self._send_loop, name="can-pump-send", daemon=True)
-            self._receive_thread = Thread(target=self._receive_loop, name="can-pump-receive", daemon=True)
             started_threads: list[Thread] = []
             try:
+                # 两个对象的构造和两次 start 属于同一个启动事务；任何一步失败都走
+                # 同一条归零、关闭和状态清理路径。
+                self._send_thread = Thread(target=self._send_loop, name="can-pump-send", daemon=True)
+                self._receive_thread = Thread(
+                    target=self._receive_loop,
+                    name="can-pump-receive",
+                    daemon=True,
+                )
                 self._send_thread.start()
                 started_threads.append(self._send_thread)
                 self._receive_thread.start()
@@ -443,7 +450,6 @@ class CanPump:
                 feedback = parse_pump_feedback(
                     frame,
                     timestamp=self._clock(),
-                    expected_id=self._config.feedback_id,
                 )
                 with self._state_lock:
                     self._last_feedback = feedback
@@ -492,12 +498,16 @@ class CanPump:
                 feedback = parse_pump_feedback(
                     frame,
                     timestamp=self._clock(),
-                    expected_id=self._config.feedback_id,
                 )
-                with self._state_lock:
-                    self._last_feedback = feedback
+                self._commit_feedback(feedback)
         except Exception as exc:
             self._handle_thread_failure("接收线程", exc)
+
+    def _commit_feedback(self, feedback: PumpFeedback) -> None:
+        """提交运行期反馈；与发送周期串行，禁止故障提交后再发送旧健康快照。"""
+        with self._cycle_lock:
+            with self._state_lock:
+                self._last_feedback = feedback
 
     def _handle_thread_failure(self, source: str, exc: Exception) -> None:
         """仅由首个线程故障执行归零和关闭，避免双线程重复处置同一总线。"""

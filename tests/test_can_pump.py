@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from inspect import signature
 from threading import Event, Lock, Thread as WorkerThread, current_thread
 from time import monotonic
 from types import SimpleNamespace
@@ -167,6 +168,27 @@ class TimeoutBlockingSendBus(FakeBus):
         super().send(message, timeout=timeout)
 
 
+class PausingMessageFactory:
+    """只暂停下一帧 0x217 的构造，稳定暴露反馈提交与实际发送之间的交错。"""
+
+    def __init__(self) -> None:
+        self.armed = False
+        self.entered = Event()
+        self.release = Event()
+
+    def arm(self) -> None:
+        self.armed = True
+        self.entered.clear()
+        self.release.clear()
+
+    def __call__(self, **kwargs: Any) -> FakeMessage:
+        if self.armed and kwargs["arbitration_id"] == 0x217:
+            self.armed = False
+            self.entered.set()
+            self.release.wait(1.0)
+        return FakeMessage(**kwargs)
+
+
 class ManualClock:
     def __init__(self, value: float = 0.0) -> None:
         self.value = value
@@ -209,6 +231,7 @@ def make_pump(
     clock: ManualClock | None = None,
     sleeper: ControlledSleeper | None = None,
     config: CanConfig | None = None,
+    factory=message_factory,
 ):
     clock = clock or ManualClock()
     sleeper = sleeper or ControlledSleeper(clock)
@@ -216,7 +239,7 @@ def make_pump(
     pump = pump_type(
         config or can_config(),
         bus_factory=lambda interface: bus,
-        message_factory=message_factory,
+        message_factory=factory,
         clock=clock,
         sleeper=sleeper,
         link_checker=lambda interface, bitrate: None,
@@ -273,6 +296,15 @@ def test_parse_feedback_rejects_wrong_frame_shape(frame: FakeMessage) -> None:
 def test_parse_feedback_rejects_invalid_timestamp() -> None:
     with pytest.raises(ValueError, match="timestamp"):
         api("parse_pump_feedback")(FakeMessage(0x197, bytes(8)), timestamp=float("nan"))
+
+
+def test_parse_feedback_id_is_fixed_and_cannot_be_overridden() -> None:
+    parse_feedback = api("parse_pump_feedback")
+    frame = FakeMessage(0x123, bytes(8))
+
+    assert "expected_id" not in signature(parse_feedback).parameters
+    with pytest.raises((TypeError, ValueError)):
+        parse_feedback(frame, timestamp=1.0, expected_id=0x123)
 
 
 UP_LINK = """2: can0: <NOARP,UP,LOWER_UP> mtu 16 qdisc pfifo_fast state UP mode DEFAULT
@@ -438,7 +470,15 @@ def test_preflight_waits_full_window_before_first_send() -> None:
     pump.stop()
 
 
-def test_partial_thread_start_failure_rolls_back_bus_and_started_thread(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("failing_name", "expected_joined"),
+    [("can-pump-send", 0), ("can-pump-receive", 1)],
+)
+def test_thread_start_failure_rolls_back_bus_and_started_thread(
+    monkeypatch,
+    failing_name: str,
+    expected_joined: int,
+) -> None:
     instances: list[object] = []
 
     class FailingThread:
@@ -450,8 +490,8 @@ def test_partial_thread_start_failure_rolls_back_bus_and_started_thread(monkeypa
             instances.append(self)
 
         def start(self) -> None:
-            if self.name == "can-pump-receive":
-                raise RuntimeError("receive thread refused to start")
+            if self.name == failing_name:
+                raise RuntimeError(f"{self.name} refused to start")
 
         def join(self, timeout: float | None = None) -> None:
             self.joined = True
@@ -464,9 +504,54 @@ def test_partial_thread_start_failure_rolls_back_bus_and_started_thread(monkeypa
         pump.start()
 
     assert pump.is_running is False
+    assert pump._stop_event.is_set()
+    assert pump._bus is None
+    assert pump._started_at is None
+    assert pump._send_thread is None
+    assert pump._receive_thread is None
     assert bus.shutdown_calls == 1
     assert all(bytes(frame.data) == bytes(8) for frame in bus.send_attempts[-3:])
-    assert instances[0].joined is True
+    assert sum(instance.joined for instance in instances) == expected_joined
+
+
+@pytest.mark.parametrize("failing_construction", [1, 2])
+def test_thread_construction_failure_rolls_back_all_started_state(
+    monkeypatch,
+    failing_construction: int,
+) -> None:
+    construction_count = 0
+
+    class ConstructionFailThread:
+        def __init__(self, *, target, name: str, daemon: bool) -> None:
+            nonlocal construction_count
+            construction_count += 1
+            if construction_count == failing_construction:
+                raise RuntimeError(f"thread construction {construction_count} failed")
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+
+        def start(self) -> None:
+            raise AssertionError("全部 Thread 构造成功前不得启动线程")
+
+        def join(self, timeout: float | None = None) -> None:
+            raise AssertionError("尚未启动的线程不得 join")
+
+    monkeypatch.setattr(can_module, "Thread", ConstructionFailThread)
+    bus = FakeBus()
+    pump, _, _ = make_pump(bus)
+
+    with pytest.raises(api("CanPumpError"), match="线程"):
+        pump.start()
+
+    assert pump.is_running is False
+    assert pump._stop_event.is_set()
+    assert pump._bus is None
+    assert pump._started_at is None
+    assert pump._send_thread is None
+    assert pump._receive_thread is None
+    assert bus.shutdown_calls == 1
+    assert all(bytes(frame.data) == bytes(8) for frame in bus.send_attempts[-3:])
 
 
 def test_stop_racing_receive_failure_closes_and_zeroes_bus_only_once() -> None:
@@ -567,6 +652,56 @@ def test_run_cycle_keeps_zero_during_five_second_window_then_allows_fresh_comman
     assert bus.sent[-1].arbitration_id == 0x217
     assert bytes(bus.sent[-1].data) == bytes([1, 55, 4, 5, 6, 0, 0, 0])
     assert pump.fault_reason is None
+
+    sleeper.release.set()
+    pump.stop()
+
+
+def test_fault_feedback_committed_before_send_prevents_old_nonzero_and_does_not_deadlock() -> None:
+    bus = FakeBus()
+    clock = ManualClock()
+    sleeper = ControlledSleeper(clock)
+    factory = PausingMessageFactory()
+    pump, _, _ = make_pump(bus, clock=clock, sleeper=sleeper, factory=factory)
+    pump.start()
+    assert sleeper.blocked.wait(0.5)
+
+    clock.value = 5.0
+    pump.update_command(PumpCommand(True, 60, 4, 5, 6))
+    healthy = FakeMessage(0x197, bytes([0, 0, 0, 1, 0, 0, 0, 2]))
+    bus.runtime.append(healthy)
+    wait_until(lambda: pump.last_feedback is not None and pump.last_feedback.fault_code == 0)
+
+    factory.arm()
+    cycle = WorkerThread(target=lambda: pump.run_cycle(5.0))
+    cycle.start()
+    assert factory.entered.wait(0.5)
+
+    fault = FakeMessage(0x197, bytes([0, 0, 0, 1, 0, 7, 0, 2]))
+    bus.runtime.append(fault)
+    fault_committed_while_cycle_paused = False
+    deadline = monotonic() + 0.1
+    while monotonic() < deadline:
+        feedback = pump.last_feedback
+        if feedback is not None and feedback.fault_code == 7:
+            fault_committed_while_cycle_paused = True
+            break
+        Event().wait(0.001)
+    sent_count_at_commit = len(bus.sent) if fault_committed_while_cycle_paused else None
+
+    factory.release.set()
+    cycle.join(timeout=0.5)
+    assert cycle.is_alive() is False
+    wait_until(lambda: pump.last_feedback is not None and pump.last_feedback.fault_code == 7)
+    if sent_count_at_commit is None:
+        sent_count_at_commit = len(bus.sent)
+
+    pump.run_cycle(5.0)
+    command_frames_after_fault = [
+        frame for frame in bus.sent[sent_count_at_commit:] if frame.arbitration_id == 0x217
+    ]
+    assert command_frames_after_fault
+    assert all(bytes(frame.data) == bytes(8) for frame in command_frames_after_fault)
 
     sleeper.release.set()
     pump.stop()
