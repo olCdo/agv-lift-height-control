@@ -279,6 +279,8 @@ def test_authorization_and_eof_event_snapshots_reflect_immediate_deadman_state()
     assert authorization.lift_remaining_ms > 0
     assert eof.lift_authorized is eof.lower_authorized is False
     assert eof.command == PumpCommand.safe_stop()
+    assert eof.desired_command == PumpCommand.safe_stop()
+    assert eof.zero_requested is True
 
 
 class Controller:
@@ -508,6 +510,175 @@ def test_exit_log_failure_propagates_only_after_pump_is_stopped() -> None:
         runner.run(ZeroCommandSource(), max_iterations=1)
 
     assert ("stop", None) in pump.actions
+
+
+def test_q_event_records_last_successful_actual_separately_from_requested_zero() -> None:
+    class SnapshotLogger(Logger):
+        def __init__(self):
+            super().__init__()
+            self.q_snapshot = None
+
+        def log(self, event, snapshot=None, **kwargs):
+            super().log(event, snapshot, **kwargs)
+            if event == "operator_key" and kwargs.get("operator_key") == "q":
+                self.q_snapshot = snapshot
+
+    pump = Pump()
+    pump.last_sent_command = PumpCommand(interlock=True, lift_pwm=50)
+    logger = SnapshotLogger()
+
+    runtime(
+        terminal=Terminal([TerminalEvent.keypress("q")]),
+        logger=logger,
+        pump=pump,
+    ).run(ZeroCommandSource(), max_iterations=1)
+
+    assert logger.q_snapshot.command.lift_pwm == 50
+    assert logger.q_snapshot.desired_command == PumpCommand.safe_stop()
+    assert logger.q_snapshot.zero_requested is True
+
+
+@pytest.mark.parametrize(
+    ("feedback", "reason"),
+    [
+        (None, "反馈缺失"),
+        (PumpFeedback(0.0, 0, 0, 0), "反馈超时"),
+        (PumpFeedback(0.2, 0, 7, 0), "故障码"),
+    ],
+)
+def test_motion_window_end_requires_fresh_fault_free_197_feedback(feedback, reason) -> None:
+    clock = Clock()
+    pump = Pump()
+    pump.last_feedback = feedback
+    clock.now = 0.2
+    runner = ForegroundRuntime(
+        mode="calibrate-lift",
+        terminal=Terminal([None]),
+        logger=Logger(),
+        clock=clock,
+        sleeper=clock.sleep,
+        shutdown=ShutdownLatch(),
+        pump=pump,
+        loop_period_s=0.02,
+        motion_start_delay_s=0.0,
+        feedback_timeout_s=0.15,
+        signal_installer=lambda _latch: None,
+    )
+
+    with pytest.raises(RuntimeError, match=reason):
+        runner.run(ZeroCommandSource(allow_lift=True), max_iterations=1)
+
+    assert pump.actions[-1] == ("stop", None)
+
+
+def test_bootstrap_motion_loop_deadline_gap_locks_stop_before_next_session_step() -> None:
+    clock = Clock()
+    pump = Pump()
+    source_calls = []
+
+    class Source(ZeroCommandSource):
+        def step(self, now, *_args):
+            source_calls.append(now)
+            return CommandDecision(PumpCommand.safe_stop())
+
+    def slow_sleep(_seconds):
+        clock.now += 0.101
+        pump.last_feedback = PumpFeedback(clock.now, 0, 0, 0)
+
+    runner = ForegroundRuntime(
+        mode="calibrate-lift",
+        terminal=Terminal([None, None]),
+        logger=Logger(),
+        clock=clock,
+        sleeper=slow_sleep,
+        shutdown=ShutdownLatch(),
+        pump=pump,
+        loop_period_s=0.02,
+        control_loop_timeout_s=0.1,
+        signal_installer=lambda _latch: None,
+    )
+
+    with pytest.raises(RuntimeError, match="控制循环"):
+        runner.run(Source(), max_iterations=2)
+
+    assert source_calls == [0.0]
+
+
+@pytest.mark.parametrize(
+    ("samples", "reason"),
+    [
+        (
+            [
+                HeightSample(0.0, 1, 100.0, True, None),
+                HeightSample(0.02, 2, 130.0, True, None),
+            ],
+            "速度",
+        ),
+        (
+            [
+                HeightSample(0.0, 1, 100.0, True, None),
+                HeightSample(0.0, 2, 101.0, True, None),
+            ],
+            "重复",
+        ),
+        (
+            [
+                HeightSample(0.0, 1, 100.0, True, None),
+                HeightSample(-0.01, 2, 100.0, True, None),
+            ],
+            "回退",
+        ),
+        (
+            [
+                HeightSample(0.0, 1, 100.0, True, None),
+                HeightSample(0.02, None, None, False, "串口失败"),
+            ],
+            "无效",
+        ),
+    ],
+)
+def test_shared_motion_height_guard_rejects_jump_duplicate_rollback_and_invalid(
+    samples, reason
+) -> None:
+    clock = Clock()
+    pump = Pump()
+
+    class SequenceWorker(Worker):
+        def __init__(self):
+            super().__init__()
+            self.index = 0
+
+        @property
+        def latest_sample(self):
+            value = samples[min(self.index, len(samples) - 1)]
+            self.index += 1
+            return value
+
+        @latest_sample.setter
+        def latest_sample(self, _value):
+            pass
+
+    def advance(seconds):
+        clock.now += seconds
+        pump.last_feedback = PumpFeedback(clock.now, 0, 0, 0)
+
+    runner = ForegroundRuntime(
+        mode="calibrate-lift",
+        terminal=Terminal([None, None]),
+        logger=Logger(),
+        clock=clock,
+        sleeper=advance,
+        shutdown=ShutdownLatch(),
+        pump=pump,
+        sensor_worker=SequenceWorker(),
+        loop_period_s=0.02,
+        sensor_timeout_s=0.1,
+        max_speed_mm_s=1200.0,
+        signal_installer=lambda _latch: None,
+    )
+
+    with pytest.raises(RuntimeError, match=reason):
+        runner.run(ZeroCommandSource(), max_iterations=2)
 
 
 class Frame:

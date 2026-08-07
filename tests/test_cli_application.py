@@ -16,11 +16,13 @@ def parse(*args):
         ("monitor",),
         ("observe-can",),
         ("zero-can",),
-        ("calibrate-lift",),
-        ("calibrate-lower", "--comfortable-valve", "0x50"),
+        ("calibrate-lift", "--temporary-max-mm", "1200"),
+        ("calibrate-lower",),
+        ("confirm-lower", "--comfortable-valve", "0x50"),
         ("move", "--target-mm", "120", "--temporary-max-mm", "500"),
         ("manual-lower",),
         ("survey-upper", "--temporary-max-mm", "1000"),
+        ("confirm-upper", "--soft-limit-mm", "900"),
         ("show-calibration",),
     ],
 )
@@ -51,6 +53,18 @@ def test_move_temporary_limit_is_optional_at_parse_time_for_persistent_bundle() 
 def test_survey_requires_temporary_limit() -> None:
     with pytest.raises(SystemExit):
         parse("survey-upper")
+
+
+def test_calibrate_lift_requires_temporary_limit() -> None:
+    with pytest.raises(SystemExit):
+        parse("calibrate-lift")
+
+
+def test_action_commands_reject_unsafe_early_confirmation_flags() -> None:
+    with pytest.raises(SystemExit):
+        parse("calibrate-lower", "--comfortable-valve", "0x50")
+    with pytest.raises(SystemExit):
+        parse("survey-upper", "--temporary-max-mm", "1000", "--confirm-save")
 
 
 def test_cli_main_reports_runtime_errors_in_chinese_without_traceback(monkeypatch, capsys) -> None:

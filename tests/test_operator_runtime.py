@@ -9,9 +9,13 @@ import agv_lift_height_control as package
 from agv_lift_height_control import HeightSample, PumpCommand, PumpFeedback
 from agv_lift_height_control.calibration import (
     LIFT_PWM_LEVELS,
+    LOWER_VALVE_LEVELS,
+    CalibrationBundle,
     CalibrationError,
     LiftCalibrationResult,
     LiftTrial,
+    LowerCalibrationResult,
+    LowerTrial,
 )
 from agv_lift_height_control.operator_runtime import (
     CSV_FIELDS,
@@ -25,7 +29,13 @@ from agv_lift_height_control.operator_runtime import (
     TerminalEvent,
     validate_foreground_terminal,
 )
-from agv_lift_height_control.runtime_storage import CalibrationDraftStore
+from agv_lift_height_control.runtime_storage import (
+    CalibrationDraftStore,
+    LowerCalibrationDraftStore,
+    SurveyDraft,
+    SurveyDraftStore,
+    calibration_fingerprint,
+)
 
 
 def test_runtime_public_interfaces_are_exported_from_package() -> None:
@@ -35,6 +45,9 @@ def test_runtime_public_interfaces_are_exported_from_package() -> None:
         "SensorWorker",
         "CsvEventLogger",
         "CalibrationDraftStore",
+        "LowerCalibrationDraftStore",
+        "SurveyDraft",
+        "SurveyDraftStore",
         "ForegroundRuntime",
         "PassiveCanObserver",
     ):
@@ -192,11 +205,14 @@ def test_csv_logger_writes_complete_header_cycle_event_and_real_escaping(tmp_pat
         target_mm=50.0,
         controller_state="coarse_lift",
         command=PumpCommand(interlock=True, lift_pwm=55, accel=1, decel=2),
+        desired_command=PumpCommand(interlock=True, lift_pwm=60),
+        zero_requested=False,
         lift_authorized=True,
         lower_authorized=False,
         lift_remaining_ms=650,
         lower_remaining_ms=0,
         controller_fault="故障,详情",
+        pump_fault="CAN反馈超时",
     )
     logger.log("cycle", snapshot, detail='a,b"c')
     logger.log("authorization", snapshot, operator_key="u")
@@ -209,6 +225,10 @@ def test_csv_logger_writes_complete_header_cycle_event_and_real_escaping(tmp_pat
     assert tuple(rows[0]) == CSV_FIELDS
     assert rows[0]["sample_error"] == '含逗号,与"引号"'
     assert rows[0]["detail"] == 'a,b"c'
+    assert rows[0]["command_lift_pwm"] == "55"
+    assert rows[0]["desired_lift_pwm"] == "60"
+    assert rows[0]["zero_requested"] == "False"
+    assert rows[0]["pump_fault"] == "CAN反馈超时"
     assert [row["event"] for row in rows] == ["cycle", "authorization"]
 
 
@@ -238,6 +258,60 @@ def test_calibration_draft_roundtrip_preserves_complete_trials(tmp_path) -> None
     store.save_lift(expected)
 
     assert store.load_lift() == expected
+
+
+def _lower_result() -> LowerCalibrationResult:
+    return LowerCalibrationResult(
+        min_start_valve=0x10,
+        comfortable_valve=None,
+        trials=tuple(
+            LowerTrial(
+                valve=valve,
+                displacement_mm=2.0,
+                response_delay_s=0.1,
+                direction_consistent=True,
+                success=True,
+            )
+            for valve in LOWER_VALVE_LEVELS
+        ),
+    )
+
+
+def _bundle() -> CalibrationBundle:
+    return CalibrationBundle(
+        min_stable_pwm=40,
+        coarse_pwm=60,
+        response_delay_s=0.1,
+        max_coast_mm=0.5,
+        peak_current_by_pwm={pwm: 100 + pwm for pwm in LIFT_PWM_LEVELS},
+        lower_min_start_valve=0x10,
+        lower_comfortable_valve=0x50,
+    )
+
+
+def test_lower_draft_roundtrip_preserves_all_trials_without_comfort_guess(tmp_path) -> None:
+    store = LowerCalibrationDraftStore(tmp_path / "lower-draft.json")
+
+    store.save(_lower_result())
+    loaded = store.load()
+
+    assert loaded == _lower_result()
+    assert loaded.comfortable_valve is None
+
+
+def test_survey_draft_roundtrip_binds_recommendation_to_calibration_fingerprint(tmp_path) -> None:
+    bundle = _bundle()
+    draft = SurveyDraft(
+        highest_observed_mm=1000.0,
+        suggested_soft_limit_mm=950.0,
+        temporary_max_height_mm=1200.0,
+        calibration_fingerprint=calibration_fingerprint(bundle),
+    )
+    store = SurveyDraftStore(tmp_path / "survey-draft.json")
+
+    store.save(draft)
+
+    assert store.load() == draft
 
 
 @pytest.mark.parametrize(

@@ -124,10 +124,14 @@ class PosixAnsiTerminal:
             f"目标: {_show(snapshot.target_mm)} mm    误差: {_show(snapshot.target_error_mm)} mm",
             f"实际输出: PWM={snapshot.command.lift_pwm} 阀值=0x{snapshot.command.lower_valve:02X} "
             f"加速={snapshot.command.accel} 减速={snapshot.command.decel}",
+            f"期望输出: PWM={snapshot.desired_command.lift_pwm} "
+            f"阀值=0x{snapshot.desired_command.lower_valve:02X} "
+            f"归零请求={'是' if snapshot.zero_requested else '否'}",
             f"泵电流: {_show(feedback.current_raw if feedback else None)}    "
             f"下降电流: {_show(feedback.lower_current_raw if feedback else None)}    "
             f"故障码: {_show(feedback.fault_code if feedback else None)}",
             f"控制故障: {snapshot.controller_fault or '-'}",
+            f"CAN泵状态: {snapshot.pump_fault or '-'}",
             f"授权剩余: 起升 {snapshot.lift_remaining_ms} ms / 下降 {snapshot.lower_remaining_ms} ms",
             "操作: u 起升续期700ms | d 下降续期150ms | c 请求清故障 | q 安全退出",
         )
@@ -324,11 +328,14 @@ class RuntimeSnapshot:
     target_error_mm: float | None = None
     controller_state: str | None = None
     command: PumpCommand = field(default_factory=PumpCommand.safe_stop)
+    desired_command: PumpCommand = field(default_factory=PumpCommand.safe_stop)
+    zero_requested: bool = False
     lift_authorized: bool = False
     lower_authorized: bool = False
     lift_remaining_ms: int = 0
     lower_remaining_ms: int = 0
     controller_fault: str | None = None
+    pump_fault: str | None = None
 
 
 CSV_FIELDS = (
@@ -349,6 +356,12 @@ CSV_FIELDS = (
     "command_accel",
     "command_decel",
     "command_lower_valve",
+    "desired_interlock",
+    "desired_lift_pwm",
+    "desired_accel",
+    "desired_decel",
+    "desired_lower_valve",
+    "zero_requested",
     "feedback_timestamp",
     "feedback_current_raw",
     "feedback_fault_code",
@@ -358,6 +371,7 @@ CSV_FIELDS = (
     "lift_remaining_ms",
     "lower_remaining_ms",
     "controller_fault",
+    "pump_fault",
     "operator_key",
     "detail",
 )
@@ -400,6 +414,7 @@ class CsvEventLogger:
         sample = value.sample
         feedback = value.feedback
         command = value.command
+        desired = value.desired_command
         row = {
             "wall_time": self._wall_clock(),
             "monotonic_s": self._clock(),
@@ -418,6 +433,12 @@ class CsvEventLogger:
             "command_accel": command.accel,
             "command_decel": command.decel,
             "command_lower_valve": command.lower_valve,
+            "desired_interlock": desired.interlock,
+            "desired_lift_pwm": desired.lift_pwm,
+            "desired_accel": desired.accel,
+            "desired_decel": desired.decel,
+            "desired_lower_valve": desired.lower_valve,
+            "zero_requested": value.zero_requested,
             "feedback_timestamp": feedback.timestamp if feedback else None,
             "feedback_current_raw": feedback.current_raw if feedback else None,
             "feedback_fault_code": feedback.fault_code if feedback else None,
@@ -427,6 +448,7 @@ class CsvEventLogger:
             "lift_remaining_ms": value.lift_remaining_ms,
             "lower_remaining_ms": value.lower_remaining_ms,
             "controller_fault": value.controller_fault,
+            "pump_fault": value.pump_fault,
             "operator_key": operator_key,
             "detail": detail,
         }

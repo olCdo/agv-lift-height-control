@@ -67,9 +67,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=5.0,
     )
 
-    subparsers.add_parser("calibrate-lift", help="首次起升标定并保存草稿")
-    lower = subparsers.add_parser("calibrate-lower", help="读取起升草稿并完成下降标定")
-    lower.add_argument("--comfortable-valve", required=True, type=_comfortable_valve)
+    lift = subparsers.add_parser("calibrate-lift", help="起升标定并保存草稿")
+    lift.add_argument(
+        "--temporary-max-mm",
+        required=True,
+        type=_bounded_float("起升标定临时最大高度", 0.001, 2900.0),
+    )
+    subparsers.add_parser("calibrate-lower", help="读取起升草稿并完成下降动作测量")
+    confirm_lower = subparsers.add_parser(
+        "confirm-lower", help="不打开硬件，确认已实测舒适下降阀值"
+    )
+    confirm_lower.add_argument("--comfortable-valve", required=True, type=_comfortable_valve)
 
     move = subparsers.add_parser("move", help="仅自动起升到目标高度")
     move.add_argument(
@@ -88,10 +96,13 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         type=_bounded_float("临时最大高度", 0.001, 2900.0),
     )
-    survey.add_argument(
-        "--confirm-save",
-        action="store_true",
-        help="显式确认并持久化本次建议软上限",
+    confirm_upper = subparsers.add_parser(
+        "confirm-upper", help="不打开硬件，从测量草稿确认软上限"
+    )
+    confirm_upper.add_argument(
+        "--soft-limit-mm",
+        required=True,
+        type=_bounded_float("确认软上限", 0.001, 2900.0),
     )
 
     subparsers.add_parser("show-calibration", help="显示最终标定结果")

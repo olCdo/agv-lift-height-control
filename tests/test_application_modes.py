@@ -1,13 +1,36 @@
 import json
+import io
 from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
 from agv_lift_height_control import HeightSample, PumpCommand
-from agv_lift_height_control.application import ApplicationDependencies, run_application
-from agv_lift_height_control.calibration import CalibrationError
+from agv_lift_height_control.application import (
+    ApplicationDependencies,
+    _build_control_source,
+    run_application,
+)
+from agv_lift_height_control.config import load_config
+from agv_lift_height_control.calibration import (
+    LIFT_PWM_LEVELS,
+    LOWER_VALVE_LEVELS,
+    CalibrationBundle,
+    CalibrationError,
+    CalibrationStore,
+    LiftCalibrationResult,
+    LiftTrial,
+    LowerCalibrationResult,
+    LowerTrial,
+)
 from agv_lift_height_control.operator_runtime import TerminalEvent
+from agv_lift_height_control.runtime_storage import (
+    CalibrationDraftStore,
+    LowerCalibrationDraftStore,
+    SurveyDraft,
+    SurveyDraftStore,
+    calibration_fingerprint,
+)
 
 
 class Clock:
@@ -133,7 +156,7 @@ def harness(tmp_path, events):
         lock_factory=lambda _path: lock,
         foreground_validator=lambda: calls.append("foreground"),
         signal_installer=lambda _latch: None,
-        stdout=None,
+        stdout=io.StringIO(),
     )
     return dependencies, calls, pump, observer, lock
 
@@ -147,6 +170,7 @@ def arguments(tmp_path, command, **kwargs):
         "target_mm": 100.0,
         "temporary_max_mm": 500.0,
         "confirm_save": False,
+        "soft_limit_mm": 900.0,
     }
     defaults.update(kwargs)
     return Namespace(**defaults)
@@ -204,5 +228,116 @@ def test_move_requires_final_bundle_before_hardware_factories(tmp_path) -> None:
 
     with pytest.raises(CalibrationError, match="标定文件"):
         run_application(arguments(tmp_path, "move"), dependencies=deps)
+
+    assert calls == ["foreground"]
+
+
+def lift_result() -> LiftCalibrationResult:
+    trials = tuple(
+        LiftTrial(
+            pwm=pwm,
+            repeat=repeat,
+            start_delay_s=0.1,
+            displacement_mm=2.0,
+            speed_mm_s=6.0,
+            coast_mm=0.5,
+            peak_current_raw=100 + pwm,
+            direction_consistent=True,
+            success=True,
+        )
+        for pwm in LIFT_PWM_LEVELS
+        for repeat in range(1, 4)
+    )
+    return LiftCalibrationResult(40, 60, 0.1, 0.5, {p: 100 + p for p in LIFT_PWM_LEVELS}, trials)
+
+
+def lower_result() -> LowerCalibrationResult:
+    return LowerCalibrationResult(
+        min_start_valve=0x10,
+        comfortable_valve=None,
+        trials=tuple(
+            LowerTrial(valve, 2.0, 0.1, True, True)
+            for valve in LOWER_VALVE_LEVELS
+        ),
+    )
+
+
+def final_bundle(*, soft_limit=800.0) -> CalibrationBundle:
+    return CalibrationBundle(
+        40,
+        60,
+        0.1,
+        0.5,
+        {pwm: 100 + pwm for pwm in LIFT_PWM_LEVELS},
+        0x10,
+        0x50,
+        soft_limit,
+    )
+
+
+def test_confirm_lower_is_hardware_free_and_uses_saved_successful_trial(tmp_path) -> None:
+    deps, calls, _pump, _observer, lock = harness(tmp_path, [])
+    state = tmp_path / "state"
+    CalibrationDraftStore(state / "lift-calibration-draft.json").save_lift(lift_result())
+    LowerCalibrationDraftStore(state / "lower-calibration-draft.json").save(lower_result())
+
+    run_application(
+        arguments(tmp_path, "confirm-lower", comfortable_valve=0x50),
+        dependencies=deps,
+    )
+
+    assert calls == []
+    assert lock.acquired == lock.released == 1
+    assert CalibrationStore(state / "calibration.json").load().lower_comfortable_valve == 0x50
+
+
+def test_confirm_upper_is_hardware_free_and_rejects_value_above_safe_suggestion(tmp_path) -> None:
+    deps, calls, _pump, _observer, _lock = harness(tmp_path, [])
+    state = tmp_path / "state"
+    bundle = final_bundle(soft_limit=None)
+    CalibrationStore(state / "calibration.json").save(bundle)
+    SurveyDraftStore(state / "upper-survey-draft.json").save(
+        SurveyDraft(1000.0, 950.0, 1200.0, calibration_fingerprint(bundle))
+    )
+
+    with pytest.raises(CalibrationError, match="建议"):
+        run_application(
+            arguments(tmp_path, "confirm-upper", soft_limit_mm=951.0),
+            dependencies=deps,
+        )
+    assert calls == []
+
+    run_application(
+        arguments(tmp_path, "confirm-upper", soft_limit_mm=900.0),
+        dependencies=deps,
+    )
+    assert CalibrationStore(state / "calibration.json").load().soft_upper_limit_mm == 900.0
+
+
+def test_calibrate_lift_effective_limit_is_minimum_of_temporary_persistent_and_absolute(
+    tmp_path,
+) -> None:
+    config_file = config_path(tmp_path)
+    config = load_config(config_file)
+    store = CalibrationStore(tmp_path / "state" / "calibration.json")
+    store.save(final_bundle(soft_limit=800.0))
+
+    source = _build_control_source(
+        Namespace(command="calibrate-lift", temporary_max_mm=1000.0),
+        config,
+        store,
+    )
+
+    assert source.session._absolute_max_height_mm == 800.0
+
+
+def test_calibrate_lift_missing_gate_refuses_before_hardware_factories(tmp_path) -> None:
+    deps, calls, _pump, _observer, _lock = harness(tmp_path, [])
+
+    with pytest.raises(CalibrationError, match="临时最大高度"):
+        run_application(
+            arguments(tmp_path, "calibrate-lift", temporary_max_mm=None),
+            dependencies=deps,
+        )
 
     assert calls == ["foreground"]
