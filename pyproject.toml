@@ -9,7 +9,7 @@ description = "AGV lift height control foundation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "pymodbus>=3.6,<4",
+    "pymodbus[serial]>=3.6,<4",
     "python-can>=4.3,<5",
 ]
 

@@ -24,3 +24,9 @@ def test_gitignore_keeps_example_but_excludes_runtime_data() -> None:
     assert is_ignored("upper-survey-draft.json")
     assert is_ignored("agv-lift-height-control.lock")
     assert is_ignored("height-log.csv")
+
+
+def test_runtime_dependencies_include_modbus_serial_transport() -> None:
+    pyproject = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert '"pymodbus[serial]>=3.6,<4"' in pyproject

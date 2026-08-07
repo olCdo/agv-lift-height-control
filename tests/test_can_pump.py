@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import sys
 from collections import deque
 from dataclasses import dataclass
 from inspect import signature
 from threading import Event, Lock, Thread as WorkerThread, current_thread
 from time import monotonic
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -36,6 +37,39 @@ def can_config(**changes: object) -> CanConfig:
     }
     values.update(changes)
     return CanConfig(**values)  # type: ignore[arg-type]
+
+
+def test_default_can_factories_import_lazy_python_can_submodules(monkeypatch) -> None:
+    """总线与消息工厂不能依赖 ``can.__init__`` 预先导出公共对象。"""
+    bus_calls = []
+    message_calls = []
+    expected_bus = object()
+    expected_message = object()
+
+    def create_bus(**kwargs):
+        bus_calls.append(kwargs)
+        return expected_bus
+
+    def create_message(**kwargs):
+        message_calls.append(kwargs)
+        return expected_message
+
+    can_package = ModuleType("can")
+    can_package.__path__ = []  # type: ignore[attr-defined]
+    interface_module = ModuleType("can.interface")
+    interface_module.Bus = create_bus  # type: ignore[attr-defined]
+    message_module = ModuleType("can.message")
+    message_module.Message = create_message  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "can", can_package)
+    monkeypatch.setitem(sys.modules, "can.interface", interface_module)
+    monkeypatch.setitem(sys.modules, "can.message", message_module)
+
+    assert not hasattr(can_package, "Bus")
+    assert not hasattr(can_package, "Message")
+    assert can_module._create_socketcan_bus("can0") is expected_bus
+    assert can_module._create_can_message(arbitration_id=0x197) is expected_message
+    assert bus_calls == [{"interface": "socketcan", "channel": "can0"}]
+    assert message_calls == [{"check": True, "arbitration_id": 0x197}]
 
 
 @dataclass

@@ -657,12 +657,14 @@ class CanPump:
 
 def _create_socketcan_bus(interface: str) -> Any:
     """打开既有 SocketCAN 接口；bitrate 已由只读预检确认，不在这里配置。"""
-    import can
+    # 某些 python-can 4.x 包采用延迟导出，顶层 ``can.Bus`` 不一定存在。
+    from can.interface import Bus
 
-    return can.Bus(interface="socketcan", channel=interface)
+    return Bus(interface="socketcan", channel=interface)
 
 
 def _create_can_message(**kwargs: Any) -> Any:
-    import can
+    # 与总线工厂相同，直接导入定义模块，避免依赖顶层包的导出时机。
+    from can.message import Message
 
-    return can.Message(check=True, **kwargs)
+    return Message(check=True, **kwargs)

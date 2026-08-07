@@ -1,6 +1,6 @@
 import sys
 import threading
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -797,6 +797,17 @@ def test_passive_can_poll_returns_after_bounded_continuous_noise_then_reads_feed
     assert first_poll_calls <= 256
 
 
+def install_lazy_can_interface(monkeypatch, create_bus):
+    """安装与现场一致的延迟导出 python-can 测试包。"""
+    can_package = ModuleType("can")
+    can_package.__path__ = []  # type: ignore[attr-defined]
+    interface_module = ModuleType("can.interface")
+    interface_module.Bus = create_bus  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "can", can_package)
+    monkeypatch.setitem(sys.modules, "can.interface", interface_module)
+    return can_package
+
+
 def test_default_receive_bus_requests_exact_standard_197_filter(monkeypatch) -> None:
     calls = []
     expected_bus = object()
@@ -805,11 +816,7 @@ def test_default_receive_bus_requests_exact_standard_197_filter(monkeypatch) -> 
         calls.append(kwargs)
         return expected_bus
 
-    monkeypatch.setitem(
-        sys.modules,
-        "can",
-        SimpleNamespace(interface=SimpleNamespace(Bus=create_bus)),
-    )
+    install_lazy_can_interface(monkeypatch, create_bus)
 
     assert _create_receive_bus("can0") is expected_bus
     assert calls == [
@@ -819,6 +826,22 @@ def test_default_receive_bus_requests_exact_standard_197_filter(monkeypatch) -> 
             "can_filters": [{"can_id": 0x197, "can_mask": 0x7FF, "extended": False}],
         }
     ]
+
+
+def test_default_receive_bus_imports_lazy_python_can_interface_submodule(monkeypatch) -> None:
+    """复现现场包：顶层 ``can`` 不预先暴露 ``interface`` 属性。"""
+    calls = []
+    expected_bus = object()
+
+    def create_bus(**kwargs):
+        calls.append(kwargs)
+        return expected_bus
+
+    can_package = install_lazy_can_interface(monkeypatch, create_bus)
+
+    assert not hasattr(can_package, "interface")
+    assert _create_receive_bus("can0") is expected_bus
+    assert calls[0]["channel"] == "can0"
 
 
 def test_default_receive_bus_falls_back_when_python_can_rejects_filters(monkeypatch) -> None:
@@ -831,11 +854,7 @@ def test_default_receive_bus_falls_back_when_python_can_rejects_filters(monkeypa
             raise TypeError("旧版 python-can 不支持 can_filters")
         return expected_bus
 
-    monkeypatch.setitem(
-        sys.modules,
-        "can",
-        SimpleNamespace(interface=SimpleNamespace(Bus=create_bus)),
-    )
+    install_lazy_can_interface(monkeypatch, create_bus)
 
     assert _create_receive_bus("can0") is expected_bus
     assert "can_filters" in calls[0]

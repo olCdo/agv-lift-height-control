@@ -73,12 +73,13 @@ class PassiveCanObserver:
 
 
 def _create_receive_bus(interface: str) -> Any:
-    import can
+    # 显式导入子模块，兼容不会在 ``import can`` 时预先导出 interface 的发行包。
+    from can.interface import Bus
 
     common = {"interface": "socketcan", "channel": interface}
     filters = [{"can_id": 0x197, "can_mask": 0x7FF, "extended": False}]
     try:
-        return can.interface.Bus(**common, can_filters=filters)
+        return Bus(**common, can_filters=filters)
     except TypeError:
         # 旧版 python-can 可能不接受构造期过滤器；解析层仍严格拒绝非 0x197。
-        return can.interface.Bus(**common)
+        return Bus(**common)
