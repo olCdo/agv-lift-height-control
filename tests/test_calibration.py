@@ -1,4 +1,6 @@
 import json
+from collections.abc import Mapping
+from typing import get_type_hints
 
 import pytest
 
@@ -250,6 +252,55 @@ def test_lift_session_missing_feedback_fails_closed() -> None:
     assert "反馈" in (session.fault_reason or "")
 
 
+def test_lift_session_rejects_absolute_limit_on_first_sample_and_latches_stop() -> None:
+    session = LiftCalibrationSession()
+
+    command = session.step(
+        now=0.0,
+        sample=sample(0.0, 2900.0),
+        feedback=feedback(0.0),
+        lift_authorized=True,
+    )
+
+    assert command == command.safe_stop()
+    assert session.failed
+    assert "绝对上限" in (session.fault_reason or "")
+    assert session.step(
+        now=0.01,
+        sample=sample(0.01, 100.0),
+        feedback=feedback(0.01),
+        lift_authorized=True,
+    ) == command.safe_stop()
+
+
+def test_lift_session_immediately_latches_reverse_motion_during_active_pulse() -> None:
+    session = LiftCalibrationSession(direction_tolerance_mm=0.5)
+    assert session.step(
+        now=0.0,
+        sample=sample(0.0, 100.0),
+        feedback=feedback(0.0),
+        lift_authorized=True,
+    ).lift_pwm == 40
+
+    command = session.step(
+        now=0.1,
+        sample=sample(0.1, 98.0),
+        feedback=feedback(0.1),
+        lift_authorized=True,
+    )
+
+    assert command == command.safe_stop()
+    assert session.failed
+    assert "方向反向" in (session.fault_reason or "")
+    assert session.trials == ()
+    assert session.step(
+        now=1.0,
+        sample=sample(1.0, 101.0),
+        feedback=feedback(1.0),
+        lift_authorized=True,
+    ) == command.safe_stop()
+
+
 def test_lower_session_feedback_fault_during_output_latches_failure() -> None:
     session = LowerCalibrationSession()
     assert session.step(
@@ -409,6 +460,10 @@ def test_calibration_bundle_copies_and_freezes_peak_current_mapping() -> None:
     assert bundle.peak_current_by_pwm[50] == 500
     with pytest.raises(TypeError):
         bundle.peak_current_by_pwm[50] = 0  # type: ignore[index]
+
+
+def test_calibration_bundle_exposes_peak_currents_as_read_only_mapping() -> None:
+    assert get_type_hints(CalibrationBundle)["peak_current_by_pwm"] == Mapping[int, int]
 
 
 def test_calibration_store_revalidates_bundle_before_writing(tmp_path) -> None:

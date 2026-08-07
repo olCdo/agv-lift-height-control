@@ -305,6 +305,8 @@ class LiftCalibrationSession:
         except CalibrationError as exc:
             return self._fail(str(exc))
         self._last_now = timestamp
+        if height >= self._absolute_max_height_mm:
+            return self._fail("起升标定高度达到绝对上限")
         self.fault_reason = None
         if self.done:
             return PumpCommand.safe_stop()
@@ -315,6 +317,8 @@ class LiftCalibrationSession:
         elapsed = timestamp - self._active_started_at
         if elapsed < 0:
             raise CalibrationError("标定时钟不得回退")
+        if height < self._start_height - self._direction_tolerance_mm:
+            return self._fail("起升标定期间高度方向反向")
         self._observe(timestamp, height, checked_feedback)
         # 调用时钟是浮点数，边界比较保留皮秒量级容差，避免 0.3 被表示为
         # 0.299999999999 而意外多通电一个控制周期。
@@ -527,7 +531,7 @@ class CalibrationBundle:
     coarse_pwm: int
     response_delay_s: float
     max_coast_mm: float
-    peak_current_by_pwm: dict[int, int]
+    peak_current_by_pwm: Mapping[int, int]
     lower_min_start_valve: int
     lower_comfortable_valve: int
     soft_upper_limit_mm: float | None = None
