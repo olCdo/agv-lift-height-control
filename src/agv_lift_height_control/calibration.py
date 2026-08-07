@@ -475,6 +475,8 @@ class LowerCalibrationSession:
         elapsed = timestamp - self._active_started_at
         if elapsed < 0:
             raise CalibrationError("标定时钟不得回退")
+        if height > self._start_height + self._direction_tolerance_mm:
+            return self._fail("下降标定期间高度方向反向")
         self._highest_height = max(self._highest_height, height)
         if self._first_movement_at is None and self._start_height - height >= 0.1:
             self._first_movement_at = timestamp

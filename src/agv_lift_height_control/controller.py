@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from math import isfinite
 
-from .calibration import LIFT_PWM_LEVELS, CalibrationBundle
+from .calibration import LIFT_PWM_LEVELS, LOWER_VALVE_LEVELS, CalibrationBundle
 from .config import ControlConfig
 from .types import HeightSample, PumpCommand, PumpFeedback
 
@@ -91,6 +91,7 @@ class HeightController:
         self._last_sample: HeightSample | None = None
         self._last_command = PumpCommand.safe_stop()
         self._lift_direction_reference_mm: float | None = None
+        self._lower_direction_reference_mm: float | None = None
         self._overcurrent_since: float | None = None
         self._overcurrent_pwm: int | None = None
         self._latched_overcurrent_pwm: int | None = None
@@ -172,7 +173,10 @@ class HeightController:
     def clear_fault(self) -> None:
         """请求清故障；只有下一次 step 的所有门禁恢复后才真正退出 FAULT。"""
         self._fault_clear_requested = True
-        if self.state is ControllerState.FAULT and self.fault_kind == "direction":
+        if self.state is ControllerState.FAULT and self.fault_kind in {
+            "direction",
+            "lower_direction",
+        }:
             self._direction_recovery_reference_mm = self.fault_height_mm
             self._direction_recovery_since = None
 
@@ -326,6 +330,14 @@ class HeightController:
                 height_mm=height,
                 timestamp=timestamp,
             )
+        plan_reason = self._external_plan_reason(desired_command)
+        if plan_reason is not None:
+            return self._fault(
+                plan_reason,
+                kind="input",
+                height_mm=height,
+                timestamp=timestamp,
+            )
 
         if desired_command.lift_pwm:
             limit_reason = self._lift_upper_limit_reason(height)
@@ -377,7 +389,13 @@ class HeightController:
             lower_authorized,
         )
         if guard_reason is not None:
-            kind = "direction" if guard_reason == "起升命令下高度方向反向" else "input"
+            kind = (
+                "direction"
+                if guard_reason == "起升命令下高度方向反向"
+                else "lower_direction"
+                if guard_reason == "下降命令下高度方向反向"
+                else "input"
+            )
             fault_height = (
                 float(sample.height_mm)
                 if isinstance(sample, HeightSample)
@@ -416,7 +434,10 @@ class HeightController:
                 return None
 
         self._last_sample = sample
-        if self.state is ControllerState.FAULT and self.fault_kind == "direction":
+        if self.state is ControllerState.FAULT and self.fault_kind in {
+            "direction",
+            "lower_direction",
+        }:
             self._handle_direction_fault_recovery(timestamp, height)
             return None
         if self.state is ControllerState.FAULT:
@@ -433,16 +454,53 @@ class HeightController:
     def _record_actual_command(
         self, command: PumpCommand, height_mm: float | None = None
     ) -> None:
-        """只按实际下发命令维护连续起升段的累计方向基准。"""
+        """只按实际下发命令维护连续起升或下降段的累计方向基准。"""
         self._last_command = command
-        if command.lift_pwm <= 0:
-            self._lift_direction_reference_mm = None
-        elif height_mm is not None:
+        if command.lift_pwm > 0:
+            self._lower_direction_reference_mm = None
+            if height_mm is None:
+                return
             self._lift_direction_reference_mm = (
                 height_mm
                 if self._lift_direction_reference_mm is None
                 else max(self._lift_direction_reference_mm, height_mm)
             )
+        elif command.lower_valve > 0:
+            self._lift_direction_reference_mm = None
+            if height_mm is None:
+                return
+            self._lower_direction_reference_mm = (
+                height_mm
+                if self._lower_direction_reference_mm is None
+                else min(self._lower_direction_reference_mm, height_mm)
+            )
+        else:
+            self._lift_direction_reference_mm = None
+            self._lower_direction_reference_mm = None
+
+    def _external_plan_reason(self, command: PumpCommand) -> str | None:
+        """外部接口只接受当前会话会实际生成的离散实测档位。"""
+        if command.accel != 0 or command.decel != 0:
+            return "外部实测计划命令的加减速字段必须为零"
+        if (
+            self._external_mode is ControllerState.LIFT_CALIBRATION
+            and command.lift_pwm
+            and command.lift_pwm not in LIFT_PWM_LEVELS
+        ):
+            return "起升标定命令不属于离散实测计划"
+        if (
+            self._external_mode is ControllerState.SURVEY
+            and command.lift_pwm
+            and command.lift_pwm != self.calibration.min_stable_pwm
+        ):
+            return "上限测量命令不属于离散实测计划"
+        if (
+            self._external_mode is ControllerState.LOWER_CALIBRATION
+            and command.lower_valve
+            and command.lower_valve not in LOWER_VALVE_LEVELS
+        ):
+            return "下降标定命令不属于离散实测计划"
+        return None
 
     def _passive_upper_limit_reason(self, height_mm: float) -> str | None:
         """非下降状态越界即锁存；人工下降恢复不调用本门禁。"""
@@ -538,6 +596,13 @@ class HeightController:
             < self._lift_direction_reference_mm - self.config.direction_tolerance_mm
         ):
             return "起升命令下高度方向反向"
+        if (
+            self._last_command.lower_valve > 0
+            and self._lower_direction_reference_mm is not None
+            and height
+            > self._lower_direction_reference_mm + self.config.direction_tolerance_mm
+        ):
+            return "下降命令下高度方向反向"
         return None
 
     def _check_overcurrent(self, now: float, feedback: PumpFeedback) -> str | None:
@@ -650,8 +715,13 @@ class HeightController:
         if reference is None:
             reference = height_mm
             self._direction_recovery_reference_mm = height_mm
-        if height_mm < reference - self.config.direction_tolerance_mm:
-            # 累计下降超过容差说明反向趋势仍在，稳定窗口从新低点重新计时。
+        reverse_continues = (
+            height_mm > reference + self.config.direction_tolerance_mm
+            if self.fault_kind == "lower_direction"
+            else height_mm < reference - self.config.direction_tolerance_mm
+        )
+        if reverse_continues:
+            # 反向趋势继续超过容差时，以新的极值重启稳定观察窗口。
             self._direction_recovery_reference_mm = height_mm
             self._direction_recovery_since = now
             return safe_stop
@@ -679,7 +749,7 @@ class HeightController:
             self.fault_kind = kind or "safety"
             self.fault_height_mm = height_mm
             self.fault_timestamp = timestamp
-            if self.fault_kind == "direction":
+            if self.fault_kind in {"direction", "lower_direction"}:
                 self._direction_recovery_reference_mm = height_mm
                 self._direction_recovery_since = None
         self.state = ControllerState.FAULT

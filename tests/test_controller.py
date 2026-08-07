@@ -279,6 +279,136 @@ def test_zero_actual_output_resets_lift_direction_reference() -> None:
     assert controller.fault_kind == "direction"
 
 
+def test_lower_direction_guard_uses_cumulative_continuous_output_reference() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.enter_external_mode(ControllerState.LOWER_CALIBRATION)
+    desired = PumpCommand(interlock=True, lower_valve=0x10)
+
+    for now, height in ((0.0, 100.0), (0.05, 100.6)):
+        assert controller.step_external(
+            now=now,
+            sample=sample(now, height),
+            feedback=feedback(now),
+            desired_command=desired,
+            lift_authorized=False,
+            lower_authorized=True,
+        ).lower_valve == 0x10
+    command = controller.step_external(
+        now=0.1,
+        sample=sample(0.1, 101.2),
+        feedback=feedback(0.1),
+        desired_command=desired,
+        lift_authorized=False,
+        lower_authorized=True,
+    )
+
+    assert command == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.FAULT
+    assert controller.fault_kind == "lower_direction"
+
+
+def test_zero_actual_output_resets_lower_direction_reference() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.enter_external_mode(ControllerState.LOWER_CALIBRATION)
+    desired = PumpCommand(interlock=True, lower_valve=0x10)
+
+    assert controller.step_external(
+        now=0.0,
+        sample=sample(0.0, 100.0),
+        feedback=feedback(0.0),
+        desired_command=desired,
+        lift_authorized=False,
+        lower_authorized=True,
+    ).lower_valve == 0x10
+    assert controller.step_external(
+        now=0.05,
+        sample=sample(0.05, 100.5),
+        feedback=feedback(0.05),
+        desired_command=desired,
+        lift_authorized=False,
+        lower_authorized=False,
+    ) == PumpCommand.safe_stop()
+    for now, height in ((0.1, 101.1), (0.15, 101.7)):
+        assert controller.step_external(
+            now=now,
+            sample=sample(now, height),
+            feedback=feedback(now),
+            desired_command=desired,
+            lift_authorized=False,
+            lower_authorized=True,
+        ).lower_valve == 0x10
+    assert controller.step_external(
+        now=0.2,
+        sample=sample(0.2, 102.3),
+        feedback=feedback(0.2),
+        desired_command=desired,
+        lift_authorized=False,
+        lower_authorized=True,
+    ) == PumpCommand.safe_stop()
+    assert controller.fault_kind == "lower_direction"
+
+
+def test_lower_direction_fault_clear_requires_stable_window_and_zero_cycle() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.enter_external_mode(ControllerState.LOWER_CALIBRATION)
+    desired = PumpCommand(interlock=True, lower_valve=0x10)
+    for now, height in ((0.0, 100.0), (0.05, 101.2)):
+        controller.step_external(
+            now=now,
+            sample=sample(now, height),
+            feedback=feedback(now),
+            desired_command=desired,
+            lift_authorized=False,
+            lower_authorized=True,
+        )
+    assert controller.fault_kind == "lower_direction"
+
+    controller.clear_fault()
+    assert controller.step_external(
+        now=0.1,
+        sample=sample(0.1, 102.0),
+        feedback=feedback(0.1),
+        desired_command=desired,
+        lift_authorized=False,
+        lower_authorized=True,
+    ) == PumpCommand.safe_stop()
+    assert controller.step_external(
+        now=0.2,
+        sample=sample(0.2, 102.3),
+        feedback=feedback(0.2),
+        desired_command=desired,
+        lift_authorized=False,
+        lower_authorized=True,
+    ) == PumpCommand.safe_stop()
+    for now in (0.3, 0.4, 0.5, 0.6):
+        assert controller.step_external(
+            now=now,
+            sample=sample(now, 102.3),
+            feedback=feedback(now),
+            desired_command=desired,
+            lift_authorized=False,
+            lower_authorized=True,
+        ) == PumpCommand.safe_stop()
+        assert controller.state is ControllerState.FAULT
+    assert controller.step_external(
+        now=0.7,
+        sample=sample(0.7, 102.3),
+        feedback=feedback(0.7),
+        desired_command=desired,
+        lift_authorized=False,
+        lower_authorized=True,
+    ) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.LOWER_CALIBRATION
+    assert controller.step_external(
+        now=0.75,
+        sample=sample(0.75, 102.3),
+        feedback=feedback(0.75),
+        desired_command=desired,
+        lift_authorized=False,
+        lower_authorized=True,
+    ).lower_valve == 0x10
+
+
 def test_direction_fault_clear_requires_500ms_stable_observation_and_zero_clear_cycle() -> None:
     controller = HeightController(control_config(), calibration())
     controller.set_target(300.0)
@@ -503,6 +633,37 @@ def test_step_external_requires_external_mode_and_exclusive_command() -> None:
     )
     assert command == PumpCommand.safe_stop()
     assert controller.state is ControllerState.FAULT
+
+
+@pytest.mark.parametrize(
+    ("mode", "desired"),
+    [
+        (ControllerState.LIFT_CALIBRATION, PumpCommand(interlock=True, lift_pwm=73)),
+        (ControllerState.SURVEY, PumpCommand(interlock=True, lift_pwm=55)),
+        (
+            ControllerState.LOWER_CALIBRATION,
+            PumpCommand(interlock=True, lower_valve=0x11),
+        ),
+    ],
+)
+def test_step_external_rejects_commands_outside_mode_measurement_plan(
+    mode: ControllerState, desired: PumpCommand
+) -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.enter_external_mode(mode)
+
+    command = controller.step_external(
+        now=0.0,
+        sample=sample(0.0, 100.0),
+        feedback=feedback(0.0, current=65535),
+        desired_command=desired,
+        lift_authorized=True,
+        lower_authorized=True,
+    )
+
+    assert command == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.FAULT
+    assert "实测计划" in (controller.fault_reason or "")
 
 
 def test_same_pwm_overcurrent_must_persist_for_200ms() -> None:

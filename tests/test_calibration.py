@@ -329,6 +329,34 @@ def test_lower_session_feedback_fault_during_output_latches_failure() -> None:
     assert session.failed
 
 
+def test_lower_session_immediately_latches_reverse_motion_and_stays_stopped() -> None:
+    session = LowerCalibrationSession(direction_tolerance_mm=0.5)
+    assert session.step(
+        now=0.0,
+        sample=sample(0.0, 100.0),
+        feedback=feedback(0.0),
+        lower_authorized=True,
+    ).lower_valve == 0x10
+
+    command = session.step(
+        now=0.05,
+        sample=sample(0.05, 100.8),
+        feedback=feedback(0.05),
+        lower_authorized=True,
+    )
+
+    assert command == command.safe_stop()
+    assert session.failed
+    assert "方向反向" in (session.fault_reason or "")
+    assert session.trials == ()
+    assert session.step(
+        now=0.85,
+        sample=sample(0.85, 99.0),
+        feedback=feedback(0.85),
+        lower_authorized=True,
+    ) == command.safe_stop()
+
+
 def test_lower_session_missing_feedback_and_clock_rollback_fail_closed() -> None:
     missing = LowerCalibrationSession()
     assert missing.step(
