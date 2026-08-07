@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .calibration import (
-    LIFT_PWM_LEVELS,
+    LIFT_CALIBRATION_PWM,
     CalibrationBundle,
     CalibrationError,
     LiftCalibrationResult,
@@ -23,11 +23,11 @@ from .calibration import (
     analyze_lower_trials,
 )
 
-DRAFT_SCHEMA_VERSION = 1
+DRAFT_SCHEMA_VERSION = 2
 
 
 class CalibrationDraftStore:
-    """原子保存完整起升结果和 27 次原始试验，不接受未知字段。"""
+    """原子保存三次短脉冲起升结果，不迁移旧版 27 次动作草稿。"""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -128,7 +128,7 @@ def _result_from_json(raw: object) -> LiftCalibrationResult:
     peaks = lift["peak_current_by_pwm"]
     if type(peaks) is not dict:
         raise CalibrationError("起升草稿 peak_current_by_pwm 必须是对象")
-    if set(peaks) != {str(pwm) for pwm in LIFT_PWM_LEVELS}:
+    if set(peaks) != {str(LIFT_CALIBRATION_PWM)}:
         raise CalibrationError("起升草稿 peak_current_by_pwm 键必须是规范十进制 PWM 字符串")
     try:
         result = LiftCalibrationResult(

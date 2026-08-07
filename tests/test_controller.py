@@ -47,6 +47,19 @@ def calibration(*, soft_limit: float | None = 2800.0, coast: float = 5.0) -> Cal
     )
 
 
+def single_level_calibration() -> CalibrationBundle:
+    return CalibrationBundle(
+        min_stable_pwm=40,
+        coarse_pwm=40,
+        response_delay_s=0.075,
+        max_coast_mm=5.0,
+        peak_current_by_pwm={40: 1000},
+        lower_min_start_valve=0x30,
+        lower_comfortable_valve=0x50,
+        soft_upper_limit_mm=2800.0,
+    )
+
+
 def sample(now: float, height: float, *, timestamp: float | None = None, valid: bool = True):
     return HeightSample(
         now if timestamp is None else timestamp,
@@ -106,6 +119,16 @@ def test_control_zones_derive_from_coast_and_use_deterministic_boundaries() -> N
     pulse = step(controller, 0.0, 100.0)
     assert controller.state is ControllerState.TERMINAL_PULSE
     assert pulse.lift_pwm == 50
+
+
+@pytest.mark.parametrize("target_mm", [200.0, 150.0, 115.0])
+def test_single_level_calibration_never_commands_above_40(target_mm: float) -> None:
+    controller = HeightController(control_config(), single_level_calibration())
+    controller.set_target(target_mm)
+
+    command = step(controller, 0.0, 100.0)
+
+    assert command.lift_pwm == 40
 
 
 def test_terminal_pulse_uses_clamped_response_and_wait_phases() -> None:

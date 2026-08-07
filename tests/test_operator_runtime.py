@@ -273,20 +273,19 @@ def test_csv_logger_writes_complete_header_cycle_event_and_real_escaping(tmp_pat
 def _lift_result() -> LiftCalibrationResult:
     trials = tuple(
         LiftTrial(
-            pwm=pwm,
+            pwm=40,
             repeat=repeat,
-            start_delay_s=0.1,
-            displacement_mm=2.0,
-            speed_mm_s=6.0,
+            start_delay_s=0.05,
+            displacement_mm=4.0,
+            speed_mm_s=40.0,
             coast_mm=0.5,
-            peak_current_raw=100 + pwm,
+            peak_current_raw=140 + repeat,
             direction_consistent=True,
             success=True,
         )
-        for pwm in LIFT_PWM_LEVELS
         for repeat in range(1, 4)
     )
-    return LiftCalibrationResult(40, 60, 0.1, 0.5, {p: 100 + p for p in LIFT_PWM_LEVELS}, trials)
+    return LiftCalibrationResult(40, 40, 0.05, 0.5, {40: 143}, trials)
 
 
 def test_calibration_draft_roundtrip_preserves_complete_trials(tmp_path) -> None:
@@ -296,6 +295,22 @@ def test_calibration_draft_roundtrip_preserves_complete_trials(tmp_path) -> None
     store.save_lift(expected)
 
     assert store.load_lift() == expected
+    raw = json.loads(store.path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == 2
+    assert len(raw["lift"]["trials"]) == 3
+    assert raw["lift"]["peak_current_by_pwm"] == {"40": 143}
+
+
+def test_calibration_draft_rejects_old_v1_without_reinterpreting_it(tmp_path) -> None:
+    path = tmp_path / "lift-draft.json"
+    store = CalibrationDraftStore(path)
+    store.save_lift(_lift_result())
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["schema_version"] = 1
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(CalibrationError, match="schema_version"):
+        store.load_lift()
 
 
 def test_calibration_draft_rejects_noncanonical_peak_current_pwm_keys(tmp_path) -> None:

@@ -20,6 +20,15 @@ from .config import ControlConfig
 from .types import HeightSample, PumpCommand, PumpFeedback
 
 LIFT_PWM_LEVELS = tuple(range(40, 81, 5))
+LIFT_CALIBRATION_PWM = 40
+LIFT_CALIBRATION_REPEATS = 3
+LIFT_PULSE_S = 0.1
+LIFT_SETTLE_S = 0.7
+LIFT_TRIAL_S = LIFT_PULSE_S + LIFT_SETTLE_S
+LIFT_CALIBRATION_PLAN = tuple(
+    (LIFT_CALIBRATION_PWM, repeat)
+    for repeat in range(1, LIFT_CALIBRATION_REPEATS + 1)
+)
 LOWER_VALVE_LEVELS = tuple(range(0x10, 0xA1, 0x10))
 CALIBRATION_SCHEMA_VERSION = 1
 
@@ -45,7 +54,7 @@ def _strict_int(name: str, value: object, minimum: int, maximum: int) -> int:
 
 @dataclass(frozen=True)
 class LiftTrial:
-    """一次 300 ms 起升试验的完整观测记录。"""
+    """一次 100 ms 起升试验及随后 700 ms 全零观察的完整记录。"""
 
     pwm: int
     repeat: int
@@ -116,35 +125,26 @@ class LowerCalibrationResult:
 
 
 def analyze_lift_trials(trials: tuple[LiftTrial, ...]) -> LiftCalibrationResult:
-    """分析严格的 40..80、每级三次计划并选择保守控制参数。"""
-    expected = [(pwm, repeat) for pwm in LIFT_PWM_LEVELS for repeat in range(1, 4)]
-    actual = [(trial.pwm, trial.repeat) for trial in trials]
-    if len(trials) != 27 or actual != expected:
-        raise CalibrationError("起升标定必须严格包含按顺序执行的 27 次试验")
+    """验证三次固定 40% 短脉冲，并生成首版闭环所需的保守参数。"""
+    actual = tuple((trial.pwm, trial.repeat) for trial in trials)
+    if actual != LIFT_CALIBRATION_PLAN:
+        raise CalibrationError("起升标定必须严格包含 40% PWM 的 3 次试验")
+    if any(
+        not trial.success
+        or not trial.direction_consistent
+        or trial.displacement_mm < 1.0
+        for trial in trials
+    ):
+        raise CalibrationError("40% PWM 的三次起升必须都同向且通电位移至少 1 mm")
 
-    min_stable_pwm: int | None = None
-    for pwm in LIFT_PWM_LEVELS:
-        group = [trial for trial in trials if trial.pwm == pwm]
-        if all(
-            trial.success and trial.direction_consistent and trial.displacement_mm >= 1.0
-            for trial in group
-        ):
-            min_stable_pwm = pwm
-            break
-    if min_stable_pwm is None:
-        raise CalibrationError("没有找到三次均稳定起升的 PWM")
-
-    stable_group = [trial for trial in trials if trial.pwm == min_stable_pwm]
-    peaks = {
-        pwm: max(trial.peak_current_raw for trial in trials if trial.pwm == pwm)
-        for pwm in LIFT_PWM_LEVELS
-    }
     return LiftCalibrationResult(
-        min_stable_pwm=min_stable_pwm,
-        coarse_pwm=min(min_stable_pwm + 20, 80),
-        response_delay_s=max(trial.start_delay_s for trial in stable_group),
+        min_stable_pwm=LIFT_CALIBRATION_PWM,
+        coarse_pwm=LIFT_CALIBRATION_PWM,
+        response_delay_s=max(trial.start_delay_s for trial in trials),
         max_coast_mm=max(trial.coast_mm for trial in trials),
-        peak_current_by_pwm=peaks,
+        peak_current_by_pwm={
+            LIFT_CALIBRATION_PWM: max(trial.peak_current_raw for trial in trials)
+        },
         trials=trials,
     )
 
@@ -235,7 +235,7 @@ def _validate_session_inputs(
 
 
 class LiftCalibrationSession:
-    """确定性起升标定会话；一次调用最多推进一个相位边界。"""
+    """执行三次固定 40% 短脉冲；通电授权与全零观察相互独立。"""
 
     def __init__(
         self,
@@ -268,12 +268,13 @@ class LiftCalibrationSession:
         self._start_height = 0.0
         self._stop_height: float | None = None
         self._lowest_height = 0.0
+        self._highest_settle_height = 0.0
         self._first_movement_at: float | None = None
         self._peak_current = 0
 
     @property
     def done(self) -> bool:
-        return self._index >= 27
+        return self._index >= LIFT_CALIBRATION_REPEATS
 
     @property
     def trials(self) -> tuple[LiftTrial, ...]:
@@ -287,13 +288,14 @@ class LiftCalibrationSession:
         feedback: PumpFeedback | None,
         lift_authorized: bool,
     ) -> PumpCommand:
-        """推进 300 ms 通电与 700 ms 稳定阶段；掉授权立即丢弃本次。"""
+        """推进 100 ms 通电与 700 ms 全零观察；观察期不再要求起升授权。"""
         if type(lift_authorized) is not bool:
             raise CalibrationError("lift_authorized 必须是 bool")
-        if not lift_authorized:
-            self._reset_active()
-            return PumpCommand.safe_stop()
         if self.failed:
+            return PumpCommand.safe_stop()
+        if self.done:
+            return PumpCommand.safe_stop()
+        if self._active_started_at is None and not lift_authorized:
             return PumpCommand.safe_stop()
         try:
             timestamp, height, checked_feedback = _validate_session_inputs(
@@ -311,8 +313,6 @@ class LiftCalibrationSession:
         if height >= self._absolute_max_height_mm:
             return self._fail("起升标定高度达到绝对上限")
         self.fault_reason = None
-        if self.done:
-            return PumpCommand.safe_stop()
         if self._active_started_at is None:
             self._begin(timestamp, height, checked_feedback)
             return PumpCommand(interlock=True, lift_pwm=self._current_pwm())
@@ -320,37 +320,48 @@ class LiftCalibrationSession:
         elapsed = timestamp - self._active_started_at
         if elapsed < 0:
             raise CalibrationError("标定时钟不得回退")
-        if height < self._start_height - self._direction_tolerance_mm:
-            return self._fail("起升标定期间高度方向反向")
-        self._observe(timestamp, height, checked_feedback)
-        # 调用时钟是浮点数，边界比较保留皮秒量级容差，避免 0.3 被表示为
-        # 0.299999999999 而意外多通电一个控制周期。
-        if elapsed + 1e-12 < 0.3:
+        # 100 ms 通电阶段才要求死手授权；一旦进入全零观察，松开 u 不会
+        # 删除已经完成的脉冲。浮点边界保留皮秒量级容差。
+        if self._stop_height is None and elapsed + 1e-12 < LIFT_PULSE_S:
+            if not lift_authorized:
+                self._reset_active()
+                return PumpCommand.safe_stop()
+            if height < self._start_height - self._direction_tolerance_mm:
+                return self._fail("起升标定期间高度方向反向")
+            self._observe_powered(timestamp, height, checked_feedback)
             return PumpCommand(interlock=True, lift_pwm=self._current_pwm())
+
         if self._stop_height is None:
+            if height < self._start_height - self._direction_tolerance_mm:
+                return self._fail("起升标定期间高度方向反向")
+            self._observe_powered(timestamp, height, checked_feedback)
             self._stop_height = height
-        if elapsed + 1e-12 < 1.0:
+            self._highest_settle_height = height
+        else:
+            self._highest_settle_height = max(self._highest_settle_height, height)
+
+        if elapsed + 1e-12 < LIFT_TRIAL_S:
             return PumpCommand.safe_stop()
 
-        self._finish(timestamp, height)
-        if self.done:
-            return PumpCommand.safe_stop()
-        self._begin(timestamp, height, checked_feedback)
-        return PumpCommand(interlock=True, lift_pwm=self._current_pwm())
+        self._finish()
+        # 即使观察结束时授权仍有效，也先保持一个全零周期；下一次 step
+        # 再根据最新的 700 ms 死手租约决定是否开始下一脉冲。
+        return PumpCommand.safe_stop()
 
     def _current_pwm(self) -> int:
-        return LIFT_PWM_LEVELS[self._index // 3]
+        return LIFT_CALIBRATION_PWM
 
     def _begin(self, now: float, height: float, feedback: PumpFeedback | None) -> None:
         self._active_started_at = now
         self._start_height = height
         self._stop_height = None
         self._lowest_height = height
+        self._highest_settle_height = height
         self._first_movement_at = None
         # 线上的泵电流是有符号原值；标定峰值用于后续过流保护，必须记录幅值。
         self._peak_current = abs(feedback.current_raw) if feedback is not None else 0
 
-    def _observe(
+    def _observe_powered(
         self, now: float, height: float, feedback: PumpFeedback | None
     ) -> None:
         self._lowest_height = min(self._lowest_height, height)
@@ -359,24 +370,24 @@ class LiftCalibrationSession:
         if self._first_movement_at is None and height - self._start_height >= 0.1:
             self._first_movement_at = now
 
-    def _finish(self, now: float, height: float) -> None:
+    def _finish(self) -> None:
         assert self._active_started_at is not None
         assert self._stop_height is not None
-        displacement = height - self._start_height
+        displacement = self._stop_height - self._start_height
         direction_ok = self._lowest_height >= self._start_height - self._direction_tolerance_mm
         delay = (
             self._first_movement_at - self._active_started_at
             if self._first_movement_at is not None
-            else 0.3
+            else LIFT_PULSE_S
         )
         self._trials.append(
             LiftTrial(
                 pwm=self._current_pwm(),
                 repeat=self._index % 3 + 1,
-                start_delay_s=min(max(delay, 0.0), 0.3),
+                start_delay_s=min(max(delay, 0.0), LIFT_PULSE_S),
                 displacement_mm=displacement,
-                speed_mm_s=max(0.0, self._stop_height - self._start_height) / 0.3,
-                coast_mm=max(0.0, height - self._stop_height),
+                speed_mm_s=max(0.0, displacement) / LIFT_PULSE_S,
+                coast_mm=max(0.0, self._highest_settle_height - self._stop_height),
                 peak_current_raw=self._peak_current,
                 direction_consistent=direction_ok,
                 success=direction_ok and displacement >= 1.0,
@@ -547,8 +558,8 @@ class CalibrationBundle:
         if self.min_stable_pwm not in LIFT_PWM_LEVELS:
             raise CalibrationError("min_stable_pwm 必须来自 40..80 的实测 PWM 级")
         _strict_int("coarse_pwm", self.coarse_pwm, self.min_stable_pwm, 80)
-        if self.coarse_pwm != min(self.min_stable_pwm + 20, 80):
-            raise CalibrationError("coarse_pwm 必须等于 min_stable_pwm+20 并封顶 80")
+        if self.coarse_pwm not in LIFT_PWM_LEVELS:
+            raise CalibrationError("coarse_pwm 必须来自 40..80 的 5% PWM 级")
         response_delay = _finite_number(
             "response_delay_s", self.response_delay_s, minimum=0
         )
@@ -566,14 +577,23 @@ class CalibrationBundle:
             raise CalibrationError(
                 "lower_comfortable_valve 必须来自不低于启动值的离散实测阀值"
             )
-        if not isinstance(self.peak_current_by_pwm, Mapping) or set(
-            self.peak_current_by_pwm
-        ) != set(LIFT_PWM_LEVELS):
-            raise CalibrationError("peak_current_by_pwm 必须包含每个起升 PWM")
+        if not isinstance(self.peak_current_by_pwm, Mapping):
+            raise CalibrationError("peak_current_by_pwm 必须是 PWM 到电流峰值的映射")
         peak_copy = dict(self.peak_current_by_pwm)
         for pwm, current in peak_copy.items():
             _strict_int("peak_current PWM", pwm, 40, 80)
+            if pwm not in LIFT_PWM_LEVELS:
+                raise CalibrationError("peak_current PWM 必须来自 40..80 的 5% PWM 级")
             _strict_int("peak_current_raw", current, 0, 65535)
+        required_levels = {
+            pwm
+            for pwm in LIFT_PWM_LEVELS
+            if self.min_stable_pwm <= pwm <= self.coarse_pwm
+        }
+        if not required_levels.issubset(peak_copy):
+            raise CalibrationError(
+                "peak_current_by_pwm 必须覆盖最小稳定 PWM 到粗升 PWM 的所有档位"
+            )
         # frozen dataclass 仍无法冻结调用方传入的 dict；复制后用只读代理阻止
         # 运行期修改使控制器和持久化 schema 漂移。
         object.__setattr__(
@@ -643,7 +663,8 @@ class CalibrationBundle:
         peaks_raw = raw["peak_current_by_pwm"]
         if type(peaks_raw) is not dict:
             raise CalibrationError("peak_current_by_pwm 必须是对象")
-        if set(peaks_raw) != {str(pwm) for pwm in LIFT_PWM_LEVELS}:
+        canonical_peak_keys = {str(pwm) for pwm in LIFT_PWM_LEVELS}
+        if not peaks_raw or not set(peaks_raw).issubset(canonical_peak_keys):
             raise CalibrationError("peak_current_by_pwm 键必须是规范的实测 PWM 字符串")
         try:
             peaks = {int(pwm): current for pwm, current in peaks_raw.items()}

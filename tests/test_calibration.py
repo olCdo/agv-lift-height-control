@@ -1,5 +1,6 @@
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import get_type_hints
 
 import pytest
@@ -29,24 +30,20 @@ def feedback(timestamp: float, current: int = 100, *, fault: int = 0) -> PumpFee
 
 
 def complete_lift_trials() -> tuple[LiftTrial, ...]:
-    trials = []
-    for pwm in LIFT_PWM_LEVELS:
-        for repeat in range(1, 4):
-            moved = 2.0 if pwm >= 50 else 0.5
-            trials.append(
-                LiftTrial(
-                    pwm=pwm,
-                    repeat=repeat,
-                    start_delay_s=0.12 + repeat / 100,
-                    displacement_mm=moved,
-                    speed_mm_s=moved / 0.3,
-                    coast_mm=float(pwm - 40) / 5,
-                    peak_current_raw=pwm * 10 + repeat,
-                    direction_consistent=True,
-                    success=moved >= 1.0,
-                )
-            )
-    return tuple(trials)
+    return tuple(
+        LiftTrial(
+            pwm=40,
+            repeat=repeat,
+            start_delay_s=0.04 + repeat / 100,
+            displacement_mm=4.0 + repeat,
+            speed_mm_s=(4.0 + repeat) / 0.1,
+            coast_mm=1.0 + repeat / 2,
+            peak_current_raw=900 + repeat * 10,
+            direction_consistent=True,
+            success=True,
+        )
+        for repeat in range(1, 4)
+    )
 
 
 def complete_lower_trials() -> tuple[LowerTrial, ...]:
@@ -62,18 +59,30 @@ def complete_lower_trials() -> tuple[LowerTrial, ...]:
     )
 
 
-def test_lift_analysis_requires_exact_plan_and_derives_safe_summary() -> None:
+def test_lift_analysis_accepts_exactly_three_40_percent_trials() -> None:
     result = analyze_lift_trials(complete_lift_trials())
 
     assert LIFT_PWM_LEVELS == tuple(range(40, 81, 5))
-    assert result.min_stable_pwm == 50
-    assert result.coarse_pwm == 70
-    assert result.response_delay_s == pytest.approx(0.15)
-    assert result.max_coast_mm == 8.0
-    assert result.peak_current_by_pwm[50] == 503
+    assert result.min_stable_pwm == 40
+    assert result.coarse_pwm == 40
+    assert result.response_delay_s == pytest.approx(0.07)
+    assert result.max_coast_mm == pytest.approx(2.5)
+    assert result.peak_current_by_pwm == {40: 930}
 
-    with pytest.raises(CalibrationError, match="27"):
+    with pytest.raises(CalibrationError, match="40%.*3"):
         analyze_lift_trials(complete_lift_trials()[:-1])
+
+
+def test_lift_analysis_rejects_noncanonical_pwm_and_failed_trial() -> None:
+    wrong_pwm = list(complete_lift_trials())
+    wrong_pwm[1] = replace(wrong_pwm[1], pwm=45)
+    with pytest.raises(CalibrationError, match="40%.*3"):
+        analyze_lift_trials(tuple(wrong_pwm))
+
+    failed = list(complete_lift_trials())
+    failed[1] = replace(failed[1], displacement_mm=0.5, success=False)
+    with pytest.raises(CalibrationError, match="至少 1 mm"):
+        analyze_lift_trials(tuple(failed))
 
 
 def test_lower_analysis_requires_exact_plan_and_explicit_measured_comfort_value() -> None:
@@ -90,45 +99,50 @@ def test_lower_analysis_requires_exact_plan_and_explicit_measured_comfort_value(
     assert confirmed.comfortable_valve == 0x50
 
 
-def test_lift_session_runs_three_300ms_pulses_per_level_with_700ms_settle() -> None:
+def test_lift_session_runs_three_100ms_pulses_with_700ms_settle() -> None:
     session = LiftCalibrationSession()
     now = 0.0
     height = 100.0
 
-    command = session.step(
-        now=now,
-        sample=sample(now, height),
-        feedback=feedback(now),
-        lift_authorized=True,
-    )
-    assert command.lift_pwm == 40
+    for repeat in range(1, 4):
+        assert session.step(
+            now=now,
+            sample=sample(now, height),
+            feedback=feedback(now, 200 + repeat),
+            lift_authorized=True,
+        ).lift_pwm == 40
 
-    for index in range(27):
-        command = session.step(
-            now=now + 0.3,
-            sample=sample(now + 0.3, height + 2.0),
-            feedback=feedback(now + 0.3, 200 + index),
+        assert session.step(
+            now=now + 0.1,
+            sample=sample(now + 0.1, height + 4.0),
+            feedback=feedback(now + 0.1, 300 + repeat),
             lift_authorized=True,
-        )
-        assert command.lift_pwm == 0
-        command = session.step(
-            now=now + 1.0,
-            sample=sample(now + 1.0, height + 2.5),
-            feedback=feedback(now + 1.0, 250 + index),
-            lift_authorized=True,
-        )
-        if index < 26:
-            assert command.lift_pwm == LIFT_PWM_LEVELS[(index + 1) // 3]
-        else:
-            assert command.lift_pwm == 0
-        height += 2.5
-        now += 1.0
+        ).lift_pwm == 0
+
+        # 观察期可以松开 u；中途达到的最高点用于计算停泵上滑。
+        assert session.step(
+            now=now + 0.4,
+            sample=sample(now + 0.4, height + 6.0),
+            feedback=feedback(now + 0.4),
+            lift_authorized=False,
+        ).lift_pwm == 0
+        assert session.step(
+            now=now + 0.8,
+            sample=sample(now + 0.8, height + 5.0),
+            feedback=feedback(now + 0.8),
+            lift_authorized=False,
+        ).lift_pwm == 0
+
+        height += 5.0
+        now += 0.81
 
     assert session.done
-    assert len(session.trials) == 27
+    assert len(session.trials) == 3
     assert [(trial.pwm, trial.repeat) for trial in session.trials] == [
-        (pwm, repeat) for pwm in LIFT_PWM_LEVELS for repeat in range(1, 4)
+        (40, repeat) for repeat in range(1, 4)
     ]
+    assert all(trial.displacement_mm == pytest.approx(4.0) for trial in session.trials)
+    assert all(trial.coast_mm == pytest.approx(2.0) for trial in session.trials)
 
 
 def test_lift_session_accepts_signed_current_and_records_peak_magnitude() -> None:
@@ -142,17 +156,17 @@ def test_lift_session_accepts_signed_current_and_records_peak_magnitude() -> Non
         lift_authorized=True,
     ).lift_pwm == 40
     assert session.step(
-        now=0.3,
-        sample=sample(0.3, 12.0),
-        feedback=feedback(0.3, -120),
+        now=0.1,
+        sample=sample(0.1, 12.0),
+        feedback=feedback(0.1, -120),
         lift_authorized=True,
     ).lift_pwm == 0
     assert session.step(
-        now=1.0,
-        sample=sample(1.0, 12.5),
-        feedback=feedback(1.0, -30),
-        lift_authorized=True,
-    ).lift_pwm == 40
+        now=0.8,
+        sample=sample(0.8, 12.5),
+        feedback=feedback(0.8, -30),
+        lift_authorized=False,
+    ).lift_pwm == 0
 
     assert session.failed is False
     assert session.trials[0].peak_current_raw == 120
@@ -168,9 +182,9 @@ def test_lift_session_authorization_loss_immediately_stops_and_restarts_trial() 
         lift_authorized=True,
     ).lift_pwm == 40
     assert session.step(
-        now=0.1,
-        sample=sample(0.1, 10.2),
-        feedback=feedback(0.1),
+        now=0.05,
+        sample=sample(0.05, 10.2),
+        feedback=feedback(0.05),
         lift_authorized=False,
     ).lift_pwm == 0
     assert session.step(
@@ -180,6 +194,32 @@ def test_lift_session_authorization_loss_immediately_stops_and_restarts_trial() 
         lift_authorized=True,
     ).lift_pwm == 40
     assert session.trials == ()
+
+
+def test_lift_session_authorization_loss_during_settle_keeps_completed_pulse() -> None:
+    session = LiftCalibrationSession()
+    assert session.step(
+        now=0.0,
+        sample=sample(0.0, 10.0),
+        feedback=feedback(0.0),
+        lift_authorized=True,
+    ).lift_pwm == 40
+
+    assert session.step(
+        now=0.1,
+        sample=sample(0.1, 14.0),
+        feedback=feedback(0.1),
+        lift_authorized=False,
+    ).lift_pwm == 0
+    assert session.step(
+        now=0.8,
+        sample=sample(0.8, 15.0),
+        feedback=feedback(0.8),
+        lift_authorized=False,
+    ).lift_pwm == 0
+
+    assert len(session.trials) == 1
+    assert session.trials[0].displacement_mm == pytest.approx(4.0)
 
 
 def test_lower_session_uses_150ms_pulse_and_700ms_observation() -> None:
@@ -423,6 +463,31 @@ def test_calibration_store_round_trip_and_atomic_file(tmp_path) -> None:
     assert store.load() == bundle
     assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 1
     assert list(path.parent.glob("*.tmp")) == []
+
+
+def test_calibration_bundle_accepts_single_level_lift_result() -> None:
+    lift = analyze_lift_trials(complete_lift_trials())
+    lower = analyze_lower_trials(complete_lower_trials()).confirm_comfortable(0x50)
+
+    bundle = CalibrationBundle.from_results(lift, lower)
+
+    assert bundle.min_stable_pwm == bundle.coarse_pwm == 40
+    assert dict(bundle.peak_current_by_pwm) == {40: 930}
+    assert CalibrationBundle.from_json_object(bundle.to_json_object()) == bundle
+
+
+def test_calibration_bundle_still_reads_legacy_complete_peak_map() -> None:
+    bundle = CalibrationBundle(
+        min_stable_pwm=50,
+        coarse_pwm=70,
+        response_delay_s=0.15,
+        max_coast_mm=5.0,
+        peak_current_by_pwm={pwm: pwm * 10 for pwm in LIFT_PWM_LEVELS},
+        lower_min_start_valve=0x30,
+        lower_comfortable_valve=0x50,
+    )
+
+    assert CalibrationBundle.from_json_object(bundle.to_json_object()) == bundle
 
 
 @pytest.mark.parametrize(

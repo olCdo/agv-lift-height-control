@@ -236,25 +236,24 @@ def test_move_requires_final_bundle_before_hardware_factories(tmp_path) -> None:
 def lift_result(*, current_offset=0) -> LiftCalibrationResult:
     trials = tuple(
         LiftTrial(
-            pwm=pwm,
+            pwm=40,
             repeat=repeat,
-            start_delay_s=0.1,
-            displacement_mm=2.0,
-            speed_mm_s=6.0,
+            start_delay_s=0.05,
+            displacement_mm=4.0,
+            speed_mm_s=40.0,
             coast_mm=0.5,
-            peak_current_raw=100 + pwm + current_offset,
+            peak_current_raw=140 + repeat + current_offset,
             direction_consistent=True,
             success=True,
         )
-        for pwm in LIFT_PWM_LEVELS
         for repeat in range(1, 4)
     )
     return LiftCalibrationResult(
         40,
-        60,
-        0.1,
+        40,
+        0.05,
         0.5,
-        {p: 100 + p + current_offset for p in LIFT_PWM_LEVELS},
+        {40: 143 + current_offset},
         trials,
     )
 
