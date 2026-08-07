@@ -229,6 +229,17 @@ def test_each_input_guard_fails_closed(
     assert reason in (controller.fault_reason or "")
 
 
+def test_controller_accepts_signed_current_zero_offset() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(300.0)
+
+    command = step(controller, 0.0, 100.0, current=-18)
+
+    assert command.lift_pwm == 70
+    assert controller.state is ControllerState.COARSE_LIFT
+    assert controller.fault_reason is None
+
+
 def test_control_loop_timeout_latches_fault() -> None:
     controller = HeightController(control_config(), calibration())
     step(controller, 0.0, 100.0)
@@ -495,7 +506,7 @@ def test_enter_external_mode_discards_old_lift_direction_and_current_history() -
     assert step(controller, 0.2, 300.0, current=1100).lift_pwm == 70
 
     controller.enter_external_mode(ControllerState.SURVEY)
-    command = step(controller, 0.3, 98.9, current=65535)
+    command = step(controller, 0.3, 98.9, current=32767)
 
     assert command.lift_pwm == command.lower_valve == 0
     assert controller.state is ControllerState.SURVEY
@@ -655,7 +666,7 @@ def test_step_external_rejects_commands_outside_mode_measurement_plan(
     command = controller.step_external(
         now=0.0,
         sample=sample(0.0, 100.0),
-        feedback=feedback(0.0, current=65535),
+        feedback=feedback(0.0, current=32767),
         desired_command=desired,
         lift_authorized=True,
         lower_authorized=True,
@@ -680,7 +691,7 @@ def test_same_pwm_overcurrent_must_persist_for_200ms() -> None:
     assert "电流" in (controller.fault_reason or "")
 
     controller.clear_fault()
-    still_high = step(controller, 0.4, 100.0, current=65535)
+    still_high = step(controller, 0.4, 100.0, current=32767)
     assert still_high.lift_pwm == 0
     assert controller.state is ControllerState.FAULT
     assert "未恢复" in (controller.fault_reason or "")
@@ -689,6 +700,20 @@ def test_same_pwm_overcurrent_must_persist_for_200ms() -> None:
     recovered = step(controller, 0.5, 100.0, current=0)
     assert recovered.lift_pwm == 70
     assert controller.state is ControllerState.COARSE_LIFT
+
+
+def test_negative_polarity_overcurrent_uses_current_magnitude() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(300.0)
+
+    assert step(controller, 0.0, 100.0, current=-1100).lift_pwm == 70
+    assert step(controller, 0.1, 100.0, current=-1100).lift_pwm == 70
+    assert step(controller, 0.2, 100.0, current=-1100).lift_pwm == 70
+    command = step(controller, 0.3, 100.0, current=-1100)
+
+    assert command.lift_pwm == 0
+    assert controller.state is ControllerState.FAULT
+    assert "电流" in (controller.fault_reason or "")
 
 
 def test_p_control_quantizes_up_to_a_measured_pwm_level() -> None:
@@ -742,7 +767,7 @@ def test_manual_lower_current_never_uses_lift_peak_guard() -> None:
             index * 0.1,
             100.0,
             lower_authorized=True,
-            current=65535,
+            current=32767,
         )
         assert command.lower_valve == 0x50
         assert controller.state is ControllerState.MANUAL_LOWER

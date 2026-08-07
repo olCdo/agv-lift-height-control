@@ -221,7 +221,10 @@ def _validate_session_inputs(
         raise CalibrationError("标定 CAN 泵反馈已超时或来自未来")
     if type(feedback.fault_code) is not int or feedback.fault_code != 0:
         raise CalibrationError(f"标定 CAN 泵反馈故障码 {feedback.fault_code}")
-    if type(feedback.current_raw) is not int or not 0 <= feedback.current_raw <= 65535:
+    if (
+        type(feedback.current_raw) is not int
+        or not -32768 <= feedback.current_raw <= 32767
+    ):
         raise CalibrationError("标定 CAN 泵电流不合理")
     if (
         type(feedback.lower_current_raw) is not int
@@ -344,14 +347,15 @@ class LiftCalibrationSession:
         self._stop_height = None
         self._lowest_height = height
         self._first_movement_at = None
-        self._peak_current = feedback.current_raw if feedback is not None else 0
+        # 线上的泵电流是有符号原值；标定峰值用于后续过流保护，必须记录幅值。
+        self._peak_current = abs(feedback.current_raw) if feedback is not None else 0
 
     def _observe(
         self, now: float, height: float, feedback: PumpFeedback | None
     ) -> None:
         self._lowest_height = min(self._lowest_height, height)
         if feedback is not None:
-            self._peak_current = max(self._peak_current, feedback.current_raw)
+            self._peak_current = max(self._peak_current, abs(feedback.current_raw))
         if self._first_movement_at is None and height - self._start_height >= 0.1:
             self._first_movement_at = now
 

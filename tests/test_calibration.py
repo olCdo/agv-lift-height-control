@@ -131,6 +131,33 @@ def test_lift_session_runs_three_300ms_pulses_per_level_with_700ms_settle() -> N
     ]
 
 
+def test_lift_session_accepts_signed_current_and_records_peak_magnitude() -> None:
+    """现场负极性的泵电流仍是有效反馈，标定峰值应保存电流幅值。"""
+    session = LiftCalibrationSession()
+
+    assert session.step(
+        now=0.0,
+        sample=sample(0.0, 10.0),
+        feedback=feedback(0.0, -18),
+        lift_authorized=True,
+    ).lift_pwm == 40
+    assert session.step(
+        now=0.3,
+        sample=sample(0.3, 12.0),
+        feedback=feedback(0.3, -120),
+        lift_authorized=True,
+    ).lift_pwm == 0
+    assert session.step(
+        now=1.0,
+        sample=sample(1.0, 12.5),
+        feedback=feedback(1.0, -30),
+        lift_authorized=True,
+    ).lift_pwm == 40
+
+    assert session.failed is False
+    assert session.trials[0].peak_current_raw == 120
+
+
 def test_lift_session_authorization_loss_immediately_stops_and_restarts_trial() -> None:
     session = LiftCalibrationSession()
 

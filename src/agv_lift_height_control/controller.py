@@ -429,7 +429,7 @@ class HeightController:
             and self._latched_overcurrent_pwm is not None
         ):
             peak = self.calibration.peak_current_by_pwm[self._latched_overcurrent_pwm]
-            if feedback.current_raw > self.config.current_multiplier * peak:
+            if abs(feedback.current_raw) > self.config.current_multiplier * peak:
                 self._fault("泵电流仍高于标定阈值，过流条件未恢复")
                 return None
 
@@ -577,7 +577,10 @@ class HeightController:
             return "CAN 泵反馈已超时或来自未来"
         if type(feedback.fault_code) is not int or feedback.fault_code != 0:
             return f"CAN 泵反馈故障码 {feedback.fault_code}"
-        if type(feedback.current_raw) is not int or not 0 <= feedback.current_raw <= 65535:
+        if (
+            type(feedback.current_raw) is not int
+            or not -32768 <= feedback.current_raw <= 32767
+        ):
             return "CAN 泵电流反馈不合理"
 
         if self._last_sample is not None and self._last_sample.height_mm is not None:
@@ -613,13 +616,15 @@ class HeightController:
             self._overcurrent_pwm = None
             return None
         threshold = self.config.current_multiplier * peak
+        # 电流原值保留传感器极性，但过流保护只关心负载幅值。
+        current_magnitude = abs(feedback.current_raw)
         if self._overcurrent_pwm != pwm:
             # 过流持续时间只属于具体实测 PWM；换挡后必须从新 PWM 的首帧
             # 重新计时，不能沿用上一档积累的时间。
             self._overcurrent_pwm = pwm
-            self._overcurrent_since = now if feedback.current_raw > threshold else None
+            self._overcurrent_since = now if current_magnitude > threshold else None
             return None
-        if feedback.current_raw <= threshold:
+        if current_magnitude <= threshold:
             self._overcurrent_since = None
             return None
         if self._overcurrent_since is None:
