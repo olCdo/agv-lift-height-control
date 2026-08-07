@@ -412,10 +412,6 @@ class CanPump:
 
     def run_cycle(self, now: float | None = None) -> PumpCommand:
         """执行一个确定性发送周期，并返回实际发出的门控后命令。"""
-        timestamp = self._clock() if now is None else now
-        if type(timestamp) not in {int, float} or not isfinite(float(timestamp)):
-            raise ValueError("now 必须是有限数字")
-        timestamp = float(timestamp)
         with self._cycle_lock:
             with self._state_lock:
                 bus = self._bus
@@ -427,6 +423,14 @@ class CanPump:
                 feedback = self._last_feedback
                 thread_fault = self._thread_fault
                 nmt_sent = self._nmt_sent
+
+            # 默认路径先取得接收线程提交的原子状态快照，再读取单调时钟；否则
+            # 新反馈可能被周期开始前取得的旧时间误判为来自未来。显式 now 保留
+            # 给确定性测试和启动首周期使用，其调用方负责提供同一快照时刻。
+            timestamp = self._clock() if now is None else now
+            if type(timestamp) not in {int, float} or not isfinite(float(timestamp)):
+                raise ValueError("now 必须是有限数字")
+            timestamp = float(timestamp)
 
             command, reason = select_safe_command(
                 config=self._config,
@@ -545,7 +549,9 @@ class CanPump:
                     now = self._clock()
                     if now < next_deadline:
                         continue
-                self.run_cycle(now)
+                # run_cycle 在原子状态快照之后自行取时，避免接收线程的新反馈
+                # 被调度循环在锁外取得的旧 now 误判为未来。
+                self.run_cycle()
                 next_deadline += self._config.send_period_s
                 if next_deadline <= now:
                     missed = int((now - next_deadline) / self._config.send_period_s) + 1

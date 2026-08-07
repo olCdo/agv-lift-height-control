@@ -992,6 +992,46 @@ def test_run_cycle_keeps_zero_during_five_second_window_then_allows_fresh_comman
     pump.stop()
 
 
+def test_run_cycle_timestamps_after_atomic_feedback_snapshot() -> None:
+    """接收线程在状态锁边界提交反馈时，发送周期不得使用更早的时间。"""
+    bus = FakeBus()
+    clock = ManualClock(5.0)
+    pump, _, _ = make_pump(bus, clock=clock)
+    desired = PumpCommand(True, 55, 4, 5, 6)
+    pump._bus = bus
+    pump._running = True
+    pump._started_at = 0.0
+    pump._nmt_sent = True
+    pump._desired = desired
+    pump._desired_updated_at = 5.0
+    pump._last_feedback = PumpFeedback(5.0, 1, 0, 2)
+
+    original_lock = pump._state_lock
+
+    class FeedbackCommitAtLockBoundary:
+        def __init__(self):
+            self.armed = True
+
+        def __enter__(self):
+            original_lock.acquire()
+            if self.armed:
+                self.armed = False
+                clock.value = 5.00075
+                pump._last_feedback = PumpFeedback(clock.value, 1, 0, 2)
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            original_lock.release()
+
+    pump._state_lock = FeedbackCommitAtLockBoundary()
+
+    command = pump.run_cycle()
+
+    assert command == desired
+    assert bytes(bus.sent[-1].data) == bytes((1, 55, 4, 5, 6, 0, 0, 0))
+    assert pump.fault_reason is None
+
+
 def test_after_fault_feedback_state_commit_no_later_cycle_sends_nonzero() -> None:
     bus = FakeBus()
     clock = ManualClock()
@@ -1056,6 +1096,30 @@ def test_send_thread_uses_fifty_millisecond_deadlines_and_full_frames() -> None:
     command_frames = [frame for frame in bus.sent if frame.arbitration_id == 0x217]
     assert len(command_frames) >= 4
     assert all(frame.dlc == 8 and len(frame.data) == 8 for frame in command_frames)
+    sleeper.release.set()
+    pump.stop()
+
+
+def test_send_thread_leaves_snapshot_timestamping_to_run_cycle() -> None:
+    bus = FakeBus()
+    clock = ManualClock()
+    sleeper = ControlledSleeper(clock, advances_before_block=1)
+    pump, _, _ = make_pump(bus, clock=clock, sleeper=sleeper)
+    original_run_cycle = pump.run_cycle
+    cycle_arguments = []
+
+    def recording_run_cycle(now=None):
+        cycle_arguments.append(now)
+        return original_run_cycle(now)
+
+    pump.run_cycle = recording_run_cycle
+    pump.start()
+    assert sleeper.blocked.wait(0.5)
+
+    # 启动首周期使用已经提交到状态的 started_at；后台周期必须自行在快照后取时。
+    assert cycle_arguments[0] == pytest.approx(0.0)
+    assert cycle_arguments[1:] == [None]
+
     sleeper.release.set()
     pump.stop()
 

@@ -614,6 +614,57 @@ def test_motion_window_end_requires_fresh_fault_free_197_feedback(feedback, reas
     assert pump.actions[-1] == ("stop", None)
 
 
+def test_runtime_timestamps_cycle_after_reading_concurrent_can_snapshot() -> None:
+    """CAN线程在快照读取时更新反馈，不得被旧的主循环时间误判为未来。"""
+    clock = Clock()
+    source_calls = []
+
+    class ConcurrentFeedbackPump:
+        def __init__(self):
+            self.actions = []
+            self.last_sent_command = PumpCommand.safe_stop()
+            self.thread_fault = None
+            self.fault_reason = None
+
+        @property
+        def last_feedback(self):
+            clock.now += 0.00075
+            return PumpFeedback(clock.now, 0, 0, 0)
+
+        def update_command(self, command):
+            self.actions.append(("update", command))
+
+        def start(self):
+            self.actions.append(("start", None))
+
+        def stop(self):
+            self.actions.append(("stop", None))
+
+    class Source(ZeroCommandSource):
+        def step(self, now, *_args):
+            source_calls.append(now)
+            return CommandDecision(PumpCommand.safe_stop())
+
+    pump = ConcurrentFeedbackPump()
+    runner = ForegroundRuntime(
+        mode="calibrate-lift",
+        terminal=Terminal([None]),
+        logger=Logger(),
+        clock=clock,
+        sleeper=clock.sleep,
+        shutdown=ShutdownLatch(),
+        pump=pump,
+        loop_period_s=0.02,
+        motion_start_delay_s=0.0,
+        signal_installer=lambda _latch: None,
+    )
+
+    runner.run(Source(), max_iterations=1)
+
+    assert source_calls == [pytest.approx(0.00075)]
+    assert pump.actions[-1] == ("stop", None)
+
+
 def test_bootstrap_motion_loop_deadline_gap_locks_stop_before_next_session_step() -> None:
     clock = Clock()
     pump = Pump()

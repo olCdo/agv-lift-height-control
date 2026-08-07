@@ -373,11 +373,6 @@ class ForegroundRuntime:
                     break
                 if max_iterations is not None and iterations >= max_iterations:
                     break
-                now = self.clock()
-                if type(now) not in {int, float} or not math.isfinite(float(now)) or now < 0:
-                    raise RuntimeError("主循环时钟无效")
-                now = float(now)
-
                 event = self.terminal.read_event()
                 if event is not None:
                     self._handle_event(event, command_source)
@@ -396,6 +391,13 @@ class ForegroundRuntime:
                     feedback = self.pump.last_feedback
                 else:
                     feedback = None
+
+                # 传感器和 CAN 由后台线程更新；必须先取得不可变快照，再读取本周期
+                # 单调时钟。否则线程恰好在两步之间更新时，旧 now 会把新反馈误判为未来。
+                now = self.clock()
+                if type(now) not in {int, float} or not math.isfinite(float(now)) or now < 0:
+                    raise RuntimeError("主循环时钟无效")
+                now = float(now)
 
                 motion_active = self.pump is not None and now >= motion_allowed_at
                 if motion_active:
