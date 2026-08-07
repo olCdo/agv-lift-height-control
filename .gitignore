@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+config/*.json
+!config/example.json
+calibration*.json
+state*.json
+lift-calibration-draft.json
+lower-calibration-draft.json
+upper-survey-draft.json
+agv-lift-height-control.lock
+*.csv
