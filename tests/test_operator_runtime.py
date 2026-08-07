@@ -261,6 +261,19 @@ def test_calibration_draft_roundtrip_preserves_complete_trials(tmp_path) -> None
     assert store.load_lift() == expected
 
 
+def test_calibration_draft_rejects_noncanonical_peak_current_pwm_keys(tmp_path) -> None:
+    path = tmp_path / "lift-draft.json"
+    store = CalibrationDraftStore(path)
+    store.save_lift(_lift_result())
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    peaks = raw["lift"]["peak_current_by_pwm"]
+    peaks["040"] = peaks.pop("40")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(CalibrationError, match="peak_current_by_pwm"):
+        store.load_lift()
+
+
 def _lower_result() -> LowerCalibrationResult:
     return LowerCalibrationResult(
         min_start_valve=0x10,

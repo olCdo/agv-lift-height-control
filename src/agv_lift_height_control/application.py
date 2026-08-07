@@ -34,6 +34,7 @@ from .operator_runtime import (
     RuntimeSnapshot,
     SensorWorker,
     ShutdownLatch,
+    SignalShutdownFlag,
     SingleInstanceLock,
     TerminalEvent,
     validate_foreground_terminal,
@@ -223,20 +224,28 @@ class SurveyCommandSource:
 
 
 def install_shutdown_signals(
-    latch: ShutdownLatch,
+    signal_flag: SignalShutdownFlag,
     *,
     registrar: Callable[[int, Any], Any] = signal.signal,
     signal_module: Any = signal,
 ) -> None:
-    """注册轻量处理器；处理器只写 ShutdownLatch，不做终端或硬件 I/O。"""
+    """注册最小处理器；回调只赋值简单属性，不触碰锁、Event 或 I/O。"""
 
-    def handler(signum: int, _frame: object) -> None:
-        latch.request(f"signal:{signum}")
+    reasons: dict[int, str] = {}
 
     for name in ("SIGHUP", "SIGTERM", "SIGINT"):
         number = getattr(signal_module, name, None)
         if number is not None:
-            registrar(number, handler)
+            reasons[number] = f"signal:{number}"
+
+    def make_handler(reason: str) -> Callable[[int, object], None]:
+        def handler(_signum: int, _frame: object) -> None:
+            signal_flag.pending_reason = reason
+
+        return handler
+
+    for number, reason in reasons.items():
+        registrar(number, make_handler(reason))
 
 
 class ForegroundRuntime:
@@ -260,7 +269,7 @@ class ForegroundRuntime:
         control_loop_timeout_s: float = 0.1,
         sensor_timeout_s: float = 0.1,
         max_speed_mm_s: float = 1200.0,
-        signal_installer: Callable[[ShutdownLatch], None] = install_shutdown_signals,
+        signal_installer: Callable[[SignalShutdownFlag], None] = install_shutdown_signals,
     ) -> None:
         if type(loop_period_s) not in {int, float} or not 0 < loop_period_s <= 0.1:
             raise ValueError("主循环周期必须在 0..0.1 秒内")
@@ -303,6 +312,7 @@ class ForegroundRuntime:
         self.sensor_timeout_s = float(sensor_timeout_s)
         self.max_speed_mm_s = float(max_speed_mm_s)
         self.signal_installer = signal_installer
+        self._signal_shutdown = SignalShutdownFlag()
         self.authorizer = DeadmanAuthorizer(clock=clock)
         self._last_snapshot = RuntimeSnapshot(mode)
         self._last_logged_fault: str | None = None
@@ -325,7 +335,7 @@ class ForegroundRuntime:
         self._last_motion_cycle_at = None
         self._last_guard_sample = None
         try:
-            self.signal_installer(self.shutdown)
+            self.signal_installer(self._signal_shutdown)
             self.terminal.open()
             if self.sensor_worker is not None:
                 self.sensor_worker.start()
@@ -342,6 +352,10 @@ class ForegroundRuntime:
             self.logger.log("start", self._last_snapshot)
 
             while True:
+                signal_reason = self._signal_shutdown.consume()
+                if signal_reason is not None:
+                    # 锁、Event、撤权和 CAN 归零全部留在普通主循环上下文执行。
+                    self.shutdown.request(signal_reason)
                 if self.shutdown.requested:
                     self.authorizer.revoke_all()
                     self._force_zero()

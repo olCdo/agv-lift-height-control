@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .calibration import (
+    LIFT_PWM_LEVELS,
     CalibrationBundle,
     CalibrationError,
     LiftCalibrationResult,
@@ -127,6 +128,8 @@ def _result_from_json(raw: object) -> LiftCalibrationResult:
     peaks = lift["peak_current_by_pwm"]
     if type(peaks) is not dict:
         raise CalibrationError("起升草稿 peak_current_by_pwm 必须是对象")
+    if set(peaks) != {str(pwm) for pwm in LIFT_PWM_LEVELS}:
+        raise CalibrationError("起升草稿 peak_current_by_pwm 键必须是规范十进制 PWM 字符串")
     try:
         result = LiftCalibrationResult(
             min_stable_pwm=lift["min_stable_pwm"],

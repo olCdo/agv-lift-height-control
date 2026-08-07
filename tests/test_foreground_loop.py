@@ -1,3 +1,5 @@
+import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +22,7 @@ from agv_lift_height_control.operator_runtime import (
     ShutdownLatch,
     TerminalEvent,
 )
-from agv_lift_height_control.passive_can import PassiveCanObserver
+from agv_lift_height_control.passive_can import PassiveCanObserver, _create_receive_bus
 
 
 class Clock:
@@ -174,17 +176,58 @@ def test_worker_tui_and_logger_errors_zero_before_stop(
         assert "fault" in [event for event, _kwargs in runner.logger.events]
 
 
-def test_signal_handler_only_sets_latch_and_loop_stops_safely() -> None:
+@pytest.mark.parametrize(
+    ("signal_name", "signal_number"),
+    [("SIGHUP", 1), ("SIGTERM", 15), ("SIGINT", 2)],
+)
+def test_signal_handler_never_touches_locked_latch_and_loop_stops_safely(
+    signal_name, signal_number
+) -> None:
     handlers = {}
     latch = ShutdownLatch()
-    install_shutdown_signals(latch, registrar=lambda signal_number, handler: handlers.setdefault(signal_number, handler))
-    assert handlers
-    next(iter(handlers.values()))(1, None)
     pump = Pump()
+    fake_signals = SimpleNamespace(
+        SIGHUP=1,
+        SIGTERM=15,
+        SIGINT=2,
+    )
 
-    runtime(pump=pump, latch=latch).run(ZeroCommandSource(), max_iterations=1)
+    def install(signal_target):
+        install_shutdown_signals(
+            signal_target,
+            registrar=lambda number, handler: handlers.setdefault(number, handler),
+            signal_module=fake_signals,
+        )
+        latch._lock.acquire()
+        handler_thread = threading.Thread(
+            target=handlers[signal_number], args=(signal_number, None)
+        )
+        try:
+            handler_thread.start()
+            handler_thread.join(timeout=0.1)
+            assert not handler_thread.is_alive(), f"{signal_name} 处理器触碰了普通闩锁"
+        finally:
+            latch._lock.release()
+            handler_thread.join(timeout=1.0)
+
+    runner = ForegroundRuntime(
+        mode="test",
+        terminal=Terminal(),
+        logger=Logger(),
+        clock=Clock(),
+        sleeper=lambda _seconds: None,
+        shutdown=latch,
+        pump=pump,
+        loop_period_s=0.02,
+        signal_installer=install,
+    )
+    runner.authorizer.renew_lift()
+
+    runner.run(ZeroCommandSource(), max_iterations=1)
 
     assert latch.requested
+    assert latch.reason == f"signal:{signal_number}"
+    assert not runner.authorizer.lift_authorized
     assert pump.actions[-2:] == [("update", PumpCommand.safe_stop()), ("stop", None)]
 
 
@@ -721,3 +764,79 @@ def test_passive_can_observer_parses_197_without_any_send() -> None:
 
     assert feedback == PumpFeedback(3.0, 1, 0, 2)
     assert bus.shutdowns == 1
+
+
+def test_passive_can_poll_returns_after_bounded_continuous_noise_then_reads_feedback() -> None:
+    class NoiseThenFeedbackBus:
+        def __init__(self):
+            self.noise = True
+            self.calls = 0
+
+        def recv(self, timeout=0):
+            assert timeout == 0
+            self.calls += 1
+            if self.noise:
+                if self.calls > 256:
+                    raise AssertionError("单次 poll 未在连续噪声中有界返回")
+                return SimpleNamespace(arbitration_id=0x123)
+            return Frame()
+
+    bus = NoiseThenFeedbackBus()
+    observer = PassiveCanObserver(
+        SimpleNamespace(interface="can0", bitrate=500000),
+        bus_factory=lambda _interface: bus,
+        link_checker=lambda *_args: None,
+        clock=lambda: 4.0,
+    )
+    observer.start()
+
+    assert observer.poll() is None
+    first_poll_calls = bus.calls
+    bus.noise = False
+    assert observer.poll() == PumpFeedback(4.0, 1, 0, 2)
+    assert first_poll_calls <= 256
+
+
+def test_default_receive_bus_requests_exact_standard_197_filter(monkeypatch) -> None:
+    calls = []
+    expected_bus = object()
+
+    def create_bus(**kwargs):
+        calls.append(kwargs)
+        return expected_bus
+
+    monkeypatch.setitem(
+        sys.modules,
+        "can",
+        SimpleNamespace(interface=SimpleNamespace(Bus=create_bus)),
+    )
+
+    assert _create_receive_bus("can0") is expected_bus
+    assert calls == [
+        {
+            "interface": "socketcan",
+            "channel": "can0",
+            "can_filters": [{"can_id": 0x197, "can_mask": 0x7FF, "extended": False}],
+        }
+    ]
+
+
+def test_default_receive_bus_falls_back_when_python_can_rejects_filters(monkeypatch) -> None:
+    calls = []
+    expected_bus = object()
+
+    def create_bus(**kwargs):
+        calls.append(kwargs)
+        if "can_filters" in kwargs:
+            raise TypeError("旧版 python-can 不支持 can_filters")
+        return expected_bus
+
+    monkeypatch.setitem(
+        sys.modules,
+        "can",
+        SimpleNamespace(interface=SimpleNamespace(Bus=create_bus)),
+    )
+
+    assert _create_receive_bus("can0") is expected_bus
+    assert "can_filters" in calls[0]
+    assert "can_filters" not in calls[1]

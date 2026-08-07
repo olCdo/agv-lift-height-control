@@ -210,7 +210,7 @@ def _remaining_ms(until: float, now: float) -> int:
 
 
 class ShutdownLatch:
-    """信号处理器可安全调用的只写停机闩锁。"""
+    """普通线程使用的停机闩锁；内部锁禁止从 Python 信号处理器调用。"""
 
     def __init__(self) -> None:
         self._event = Event()
@@ -234,6 +234,19 @@ class ShutdownLatch:
 
     def wait(self, timeout: float | None = None) -> bool:
         return self._event.wait(timeout)
+
+
+class SignalShutdownFlag:
+    """信号回调只写此简单属性，主循环再归并到线程安全停机闩锁。"""
+
+    def __init__(self) -> None:
+        self.pending_reason: str | None = None
+
+    def consume(self) -> str | None:
+        reason = self.pending_reason
+        if reason is not None:
+            self.pending_reason = None
+        return reason
 
 
 class SensorWorker:
