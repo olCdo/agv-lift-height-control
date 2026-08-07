@@ -85,6 +85,10 @@ class PosixAnsiTerminal:
         self.stdout = stdout
         self._opened = False
         self._original_attributes: Any = None
+        self._stdin_descriptor: int | None = None
+        self._stdout_descriptor: int | None = None
+        self._stdout_was_blocking: bool | None = None
+        self.dropped_frames = 0
 
     def open(self) -> None:
         validate_foreground_terminal(stdin=self.stdin, stdout=self.stdout)
@@ -94,12 +98,41 @@ class PosixAnsiTerminal:
         import termios
         import tty
 
-        descriptor = self.stdin.fileno()
-        self._original_attributes = termios.tcgetattr(descriptor)
-        tty.setcbreak(descriptor)
-        self._opened = True
-        self.stdout.write("\x1b[?25l\x1b[2J")
-        self.stdout.flush()
+        stdin_descriptor = self.stdin.fileno()
+        stdout_descriptor = self.stdout.fileno()
+        original_attributes = termios.tcgetattr(stdin_descriptor)
+        stdout_was_blocking = os.get_blocking(stdout_descriptor)
+        blocking_changed = False
+        terminal_changed = False
+        try:
+            # SSH PTY 背压不能阻塞安全主循环；每帧只做一次尽力写入。
+            os.set_blocking(stdout_descriptor, False)
+            blocking_changed = True
+            terminal_changed = True
+            tty.setcbreak(stdin_descriptor)
+            self._stdin_descriptor = stdin_descriptor
+            self._stdout_descriptor = stdout_descriptor
+            self._original_attributes = original_attributes
+            self._stdout_was_blocking = stdout_was_blocking
+            self._opened = True
+            self._write_text("\x1b[?25l\x1b[2J")
+        except BaseException:
+            # 保留原始打开错误；恢复动作逐项 best-effort，避免一个恢复失败
+            # 阻止其余状态（尤其 stdout blocking）回滚。
+            if terminal_changed:
+                try:
+                    termios.tcsetattr(
+                        stdin_descriptor, termios.TCSANOW, original_attributes
+                    )
+                except BaseException:
+                    pass
+            if blocking_changed:
+                try:
+                    os.set_blocking(stdout_descriptor, stdout_was_blocking)
+                except BaseException:
+                    pass
+            self._clear_open_state()
+            raise
 
     def read_event(self) -> TerminalEvent | None:
         if not self._opened:
@@ -138,22 +171,60 @@ class PosixAnsiTerminal:
         # 光标回到左上角后逐行清除旧内容；只在最后使用 ``J`` 无法清掉前面
         # 各行右侧的残留字符，例如故障码从三位缩短成两位时会伪装成三位数。
         cleared_lines = "\n".join(f"\x1b[2K{line}" for line in lines)
-        self.stdout.write("\x1b[H" + cleared_lines + "\x1b[J")
-        self.stdout.flush()
+        self._write_text("\x1b[H" + cleared_lines + "\x1b[J")
 
     def close(self) -> None:
         if not self._opened:
             return
         import termios
 
+        failure: BaseException | None = None
         try:
+            # 光标恢复也保持非阻塞；SSH 已断开时不能为了退出画面卡住停机。
+            self._write_text("\x1b[?25h\n")
+        except BaseException as exc:
+            failure = exc
+        try:
+            assert self._stdin_descriptor is not None
             termios.tcsetattr(
-                self.stdin.fileno(), termios.TCSADRAIN, self._original_attributes
+                self._stdin_descriptor, termios.TCSANOW, self._original_attributes
             )
-        finally:
-            self._opened = False
-            self.stdout.write("\x1b[?25h\n")
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+        try:
+            assert self._stdout_descriptor is not None
+            assert self._stdout_was_blocking is not None
+            os.set_blocking(self._stdout_descriptor, self._stdout_was_blocking)
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+        self._clear_open_state()
+        if failure is not None:
+            raise failure
+
+    def _write_text(self, payload: str) -> None:
+        """向真实 PTY 单次非阻塞写帧；测试用文本流保持同步兼容。"""
+        if not self._opened or self._stdout_descriptor is None:
+            self.stdout.write(payload)
             self.stdout.flush()
+            return
+        encoded = payload.encode("utf-8")
+        try:
+            written = os.write(self._stdout_descriptor, encoded)
+        except (BlockingIOError, InterruptedError):
+            self.dropped_frames += 1
+            return
+        if written != len(encoded):
+            # 不循环补写部分帧；下一次从 ESC[H 开始完整重绘。
+            self.dropped_frames += 1
+
+    def _clear_open_state(self) -> None:
+        self._opened = False
+        self._original_attributes = None
+        self._stdin_descriptor = None
+        self._stdout_descriptor = None
+        self._stdout_was_blocking = None
 
 
 def _show(value: object) -> str:

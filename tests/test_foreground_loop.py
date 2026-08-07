@@ -42,6 +42,7 @@ class Terminal:
         self.render_error = render_error
         self.opened = 0
         self.closed = 0
+        self.render_calls = 0
 
     def open(self):
         self.opened += 1
@@ -50,6 +51,7 @@ class Terminal:
         return next(self.events, None)
 
     def render(self, _snapshot):
+        self.render_calls += 1
         if self.render_error:
             raise self.render_error
 
@@ -441,6 +443,28 @@ def test_loop_uses_20ms_period_without_real_sleep() -> None:
     runner.run(ZeroCommandSource(), max_iterations=3)
 
     assert clock.now == pytest.approx(0.04)
+
+
+def test_foreground_runtime_controls_at_50hz_but_renders_about_5hz() -> None:
+    clock = Clock()
+    terminal = Terminal([None] * 51)
+
+    class CountingSource(ZeroCommandSource):
+        def __init__(self):
+            super().__init__()
+            self.step_calls = 0
+
+        def step(self, *args):
+            self.step_calls += 1
+            return super().step(*args)
+
+    source = CountingSource()
+    runner = runtime(terminal=terminal, clock=clock)
+
+    runner.run(source, max_iterations=51)
+
+    assert source.step_calls == 51
+    assert terminal.render_calls == 6
 
 
 def test_startup_nmt_window_does_not_advance_motion_session() -> None:

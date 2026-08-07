@@ -264,6 +264,7 @@ class ForegroundRuntime:
         sensor_worker: Any | None = None,
         observer: Any | None = None,
         loop_period_s: float = 0.02,
+        render_period_s: float = 0.2,
         motion_start_delay_s: float = 0.0,
         feedback_timeout_s: float = 0.15,
         control_loop_timeout_s: float = 0.1,
@@ -273,6 +274,12 @@ class ForegroundRuntime:
     ) -> None:
         if type(loop_period_s) not in {int, float} or not 0 < loop_period_s <= 0.1:
             raise ValueError("主循环周期必须在 0..0.1 秒内")
+        if (
+            type(render_period_s) not in {int, float}
+            or not math.isfinite(float(render_period_s))
+            or not 0 < render_period_s <= 1.0
+        ):
+            raise ValueError("终端刷新周期必须是 0..1 秒内的有限正数")
         if (
             type(motion_start_delay_s) not in {int, float}
             or not math.isfinite(float(motion_start_delay_s))
@@ -306,6 +313,7 @@ class ForegroundRuntime:
         self.sensor_worker = sensor_worker
         self.observer = observer
         self.loop_period_s = float(loop_period_s)
+        self.render_period_s = float(render_period_s)
         self.motion_start_delay_s = float(motion_start_delay_s)
         self.feedback_timeout_s = float(feedback_timeout_s)
         self.control_loop_timeout_s = float(control_loop_timeout_s)
@@ -332,6 +340,7 @@ class ForegroundRuntime:
         primary_error: BaseException | None = None
         self._command_source = command_source
         motion_allowed_at = started_at
+        next_render_at = started_at
         self._last_motion_cycle_at = None
         self._last_guard_sample = None
         try:
@@ -346,6 +355,7 @@ class ForegroundRuntime:
                 self.pump.start()
             # 运行时长从所有资源成功启动后计；zero-can 因而会保留完整 5 秒 NMT 零窗。
             started_at = self.clock()
+            next_render_at = started_at
             if self.pump is not None:
                 # CanPump 的 NMT 启动窗内实际只发零；会话也不得误把这段零输出计为试验。
                 motion_allowed_at = started_at + self.motion_start_delay_s
@@ -443,7 +453,11 @@ class ForegroundRuntime:
                         detail=self._last_snapshot.controller_fault,
                     )
                     self._last_logged_fault = self._last_snapshot.controller_fault
-                self.terminal.render(self._last_snapshot)
+                # SSH 显示只需约 5 Hz；安全门禁、命令计算和 CSV 仍按 20 ms
+                # 主循环执行，避免慢终端把显示频率误当成控制频率。
+                if now + 1e-12 >= next_render_at:
+                    self.terminal.render(self._last_snapshot)
+                    next_render_at = now + self.render_period_s
                 if decision.fatal_reason is not None:
                     raise RuntimeError(decision.fatal_reason)
                 if decision.done:

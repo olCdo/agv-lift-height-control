@@ -1,11 +1,14 @@
 import csv
 import io
 import json
+import sys
 import threading
+from types import ModuleType
 
 import pytest
 
 import agv_lift_height_control as package
+import agv_lift_height_control.operator_runtime as operator_runtime
 from agv_lift_height_control import HeightSample, PumpCommand, PumpFeedback
 from agv_lift_height_control.calibration import (
     LIFT_PWM_LEVELS,
@@ -177,6 +180,106 @@ def test_tui_render_shows_fault_code_in_protocol_hex_and_decimal() -> None:
     )
 
     assert "故障码: 0x52 (82)" in output.getvalue()
+
+
+class TtyFdStream:
+    def __init__(self, descriptor: int) -> None:
+        self.descriptor = descriptor
+        self.fallback_writes: list[str] = []
+
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return self.descriptor
+
+    def write(self, payload: str) -> None:
+        self.fallback_writes.append(payload)
+
+    def flush(self) -> None:
+        pass
+
+
+def install_fake_posix_terminal_modules(monkeypatch, actions: list[tuple]) -> None:
+    termios = ModuleType("termios")
+    termios.TCSANOW = 0  # type: ignore[attr-defined]
+    termios.TCSADRAIN = 1  # type: ignore[attr-defined]
+    termios.tcgetattr = lambda descriptor: ("attrs", descriptor)  # type: ignore[attr-defined]
+    termios.tcsetattr = lambda descriptor, mode, attrs: actions.append(  # type: ignore[attr-defined]
+        ("termios", descriptor, mode, attrs)
+    )
+    tty = ModuleType("tty")
+    tty.setcbreak = lambda descriptor: actions.append(("cbreak", descriptor))  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "termios", termios)
+    monkeypatch.setitem(sys.modules, "tty", tty)
+    monkeypatch.setattr(
+        operator_runtime,
+        "validate_foreground_terminal",
+        lambda **_kwargs: None,
+    )
+
+
+def test_posix_terminal_drops_blocked_frame_and_restores_terminal(monkeypatch) -> None:
+    actions: list[tuple] = []
+    payloads: list[bytes] = []
+    install_fake_posix_terminal_modules(monkeypatch, actions)
+    monkeypatch.setattr(operator_runtime.os, "get_blocking", lambda _descriptor: True)
+    monkeypatch.setattr(
+        operator_runtime.os,
+        "set_blocking",
+        lambda descriptor, blocking: actions.append(("blocking", descriptor, blocking)),
+    )
+
+    def write(descriptor: int, payload: bytes) -> int:
+        payloads.append(payload)
+        actions.append(("write", descriptor))
+        if len(payloads) == 2:
+            raise BlockingIOError
+        return len(payload)
+
+    monkeypatch.setattr(operator_runtime.os, "write", write)
+    terminal = PosixAnsiTerminal(stdin=TtyFdStream(10), stdout=TtyFdStream(11))
+
+    terminal.open()
+    terminal.render(RuntimeSnapshot(mode="monitor"))
+    terminal.close()
+
+    assert terminal.dropped_frames == 1
+    assert ("blocking", 11, False) in actions
+    assert actions[-1] == ("blocking", 11, True)
+    termios_actions = [action for action in actions if action[0] == "termios"]
+    assert termios_actions == [("termios", 10, 0, ("attrs", 10))]
+    assert payloads[0] == b"\x1b[?25l\x1b[2J"
+    assert payloads[-1] == b"\x1b[?25h\n"
+
+
+def test_posix_terminal_drops_partial_frame_and_next_render_is_complete(
+    monkeypatch,
+) -> None:
+    actions: list[tuple] = []
+    payloads: list[bytes] = []
+    install_fake_posix_terminal_modules(monkeypatch, actions)
+    monkeypatch.setattr(operator_runtime.os, "get_blocking", lambda _descriptor: True)
+    monkeypatch.setattr(operator_runtime.os, "set_blocking", lambda *_args: None)
+
+    def write(_descriptor: int, payload: bytes) -> int:
+        payloads.append(payload)
+        if len(payloads) == 2:
+            return 5
+        return len(payload)
+
+    monkeypatch.setattr(operator_runtime.os, "write", write)
+    terminal = PosixAnsiTerminal(stdin=TtyFdStream(10), stdout=TtyFdStream(11))
+    terminal.open()
+
+    terminal.render(RuntimeSnapshot(mode="first"))
+    terminal.render(RuntimeSnapshot(mode="second"))
+    terminal.close()
+
+    assert terminal.dropped_frames == 1
+    assert payloads[2].startswith(b"\x1b[H")
+    assert payloads[2].endswith(b"\x1b[J")
+    assert "模式: second" in payloads[2].decode("utf-8")
 
 
 class ScriptedSource:
