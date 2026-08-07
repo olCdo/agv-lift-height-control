@@ -3,7 +3,13 @@ import json
 import pytest
 
 import agv_lift_height_control as package
-from agv_lift_height_control import ConfigError, ControlConfig, SensorConfig, load_config
+from agv_lift_height_control import (
+    ConfigError,
+    ControlConfig,
+    SensorConfig,
+    StorageConfig,
+    load_config,
+)
 
 
 def valid_control_config() -> dict[str, object]:
@@ -56,7 +62,10 @@ def valid_config() -> dict[str, object]:
             "shutdown_zero_frames": 3,
         },
         "control": valid_control_config(),
-        "storage": {},
+        "storage": {
+            "state_dir": "~/.local/state/agv-lift-height-control",
+            "log_dir": "~/.local/state/agv-lift-height-control/logs",
+        },
     }
 
 
@@ -83,6 +92,37 @@ def test_load_config_returns_typed_can_settings(tmp_path) -> None:
     assert config.can.command_id == 0x217
     assert config.can.feedback_id == 0x197
     assert config.can.shutdown_zero_frames == 3
+
+
+def test_load_config_returns_typed_expanded_storage_without_creating_it(
+    tmp_path, monkeypatch
+) -> None:
+    fake_home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+    config = load_config(write_config(tmp_path, valid_config()))
+
+    assert isinstance(config.storage, StorageConfig)
+    assert config.storage.state_dir == fake_home / ".local/state/agv-lift-height-control"
+    assert config.storage.log_dir == fake_home / ".local/state/agv-lift-height-control/logs"
+    assert not fake_home.exists()
+
+
+@pytest.mark.parametrize(
+    "storage",
+    [
+        {"state_dir": "", "log_dir": "/tmp/logs"},
+        {"state_dir": "/tmp/state", "log_dir": "   "},
+        {"state_dir": "/tmp/state", "log_dir": "/tmp/logs", "typo": True},
+    ],
+)
+def test_storage_config_rejects_empty_paths_and_unknown_fields(tmp_path, storage) -> None:
+    data = valid_config()
+    data["storage"] = storage
+
+    with pytest.raises(ConfigError, match="storage"):
+        load_config(write_config(tmp_path, data))
 
 
 def test_load_config_returns_strict_typed_control_settings(tmp_path) -> None:

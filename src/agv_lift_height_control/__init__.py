@@ -27,11 +27,33 @@ from .calibration import (
     analyze_lift_trials,
     analyze_lower_trials,
 )
-from .config import AppConfig, CanConfig, ConfigError, ControlConfig, SensorConfig, load_config
+from .config import (
+    AppConfig,
+    CanConfig,
+    ConfigError,
+    ControlConfig,
+    SensorConfig,
+    StorageConfig,
+    load_config,
+)
 from .controller import ControllerState, HeightController
 from .modbus_rtu import ModbusRtuHeightSource
+from .operator_runtime import (
+    CsvEventLogger,
+    DeadmanAuthorizer,
+    PosixAnsiTerminal,
+    RuntimeSnapshot,
+    SensorWorker,
+    ShutdownLatch,
+    SingleInstanceLock,
+    TerminalEvent,
+    validate_foreground_terminal,
+)
+from .passive_can import PassiveCanObserver
+from .runtime_storage import CalibrationDraftStore
 from .simulation import HydraulicLiftSimulator, HydraulicSnapshot
 from .types import HeightSample, HeightSource, PumpCommand, PumpFeedback
+from .application import ForegroundRuntime
 
 __all__ = [
     "AppConfig",
@@ -42,16 +64,22 @@ __all__ = [
     "CanPumpError",
     "CalibrationBundle",
     "CalibrationError",
+    "CalibrationDraftStore",
     "CalibrationStore",
     "ConfigError",
     "ControlConfig",
     "ControllerState",
+    "CsvEventLogger",
+    "DeadmanAuthorizer",
+    "ForegroundRuntime",
     "HeightSample",
     "HeightController",
     "HeightSource",
     "HydraulicLiftSimulator",
     "HydraulicSnapshot",
     "ModbusRtuHeightSource",
+    "PassiveCanObserver",
+    "PosixAnsiTerminal",
     "LIFT_PWM_LEVELS",
     "LOWER_VALVE_LEVELS",
     "LiftCalibrationResult",
@@ -64,12 +92,19 @@ __all__ = [
     "PumpCommand",
     "PumpFeedback",
     "SensorConfig",
+    "SensorWorker",
+    "ShutdownLatch",
+    "SingleInstanceLock",
+    "StorageConfig",
+    "RuntimeSnapshot",
+    "TerminalEvent",
     "encode_nmt_start",
     "encode_pump_command",
     "inspect_can_link",
     "load_config",
     "parse_pump_feedback",
     "select_safe_command",
+    "validate_foreground_terminal",
     "analyze_lift_trials",
     "analyze_lower_trials",
 ]

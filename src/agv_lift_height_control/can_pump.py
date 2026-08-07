@@ -246,6 +246,7 @@ class CanPump:
         self._nmt_sent = False
         self._desired = PumpCommand.safe_stop()
         self._desired_updated_at: float | None = None
+        self._last_sent_command = PumpCommand.safe_stop()
         self._last_feedback: PumpFeedback | None = None
         self._fault_reason: str | None = "CAN 泵尚未启动"
         self._thread_fault: str | None = None
@@ -266,9 +267,21 @@ class CanPump:
             return self._last_feedback
 
     @property
+    def last_sent_command(self) -> PumpCommand:
+        """返回最近一次成功写入 0x217 的门控后命令，供 TUI/CSV 记录实际输出。"""
+        with self._state_lock:
+            return self._last_sent_command
+
+    @property
     def fault_reason(self) -> str | None:
         with self._state_lock:
             return self._fault_reason
+
+    @property
+    def thread_fault(self) -> str | None:
+        """向前台主循环暴露发送/接收线程的锁存异常。"""
+        with self._state_lock:
+            return self._thread_fault
 
     def update_command(self, command: PumpCommand) -> None:
         """原子保存期望命令和更新时间；启动前调用安全，但命令仍会按超时失效。"""
@@ -341,6 +354,7 @@ class CanPump:
                 self._started_at = started_at
                 self._nmt_sent = False
                 self._thread_fault = None
+                self._last_sent_command = PumpCommand.safe_stop()
                 self._fault_reason = "CAN 泵处于启动 NMT 安全窗口，强制全零"
 
             # 预检结束后才允许第一次发送；启动即发 NMT，0x217 同周期保持全零。
@@ -427,6 +441,8 @@ class CanPump:
                 with self._state_lock:
                     self._nmt_sent = True
             self._send_payload(bus, self._config.command_id, encode_pump_command(command))
+            with self._state_lock:
+                self._last_sent_command = command
             return command
 
     def stop(self) -> None:
@@ -586,12 +602,18 @@ class CanPump:
 
     def _send_shutdown_zero_frames(self, bus: Any) -> None:
         """逐帧尽力发送；一次失败不阻止后续零帧尝试。"""
-        payload = encode_pump_command(PumpCommand.safe_stop())
+        safe_stop = PumpCommand.safe_stop()
+        payload = encode_pump_command(safe_stop)
+        sent = False
         for _ in range(self._config.shutdown_zero_frames):
             try:
                 self._send_payload(bus, self._config.command_id, payload)
+                sent = True
             except Exception:
                 pass
+        if sent:
+            with self._state_lock:
+                self._last_sent_command = safe_stop
 
     @staticmethod
     def _thread_is_alive(thread: object | None) -> bool:

@@ -164,17 +164,39 @@ class ControlConfig:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    """运行状态与 CSV 日志目录；加载配置只展开路径，不创建目录。"""
+
+    state_dir: Path
+    log_dir: Path
+
+    def __post_init__(self) -> None:
+        for name in ("state_dir", "log_dir"):
+            value = getattr(self, name)
+            if isinstance(value, Path):
+                text = str(value)
+            elif type(value) is str:
+                text = value
+            else:
+                raise ConfigError(f"storage.{name} 必须是非空路径字符串")
+            if not text.strip():
+                raise ConfigError(f"storage.{name} 必须是非空路径字符串")
+            object.__setattr__(self, name, Path(text).expanduser())
+
+
+@dataclass(frozen=True)
 class AppConfig:
     sensor: SensorConfig
     can: CanConfig
     control: ControlConfig
-    storage: dict[str, Any]
+    storage: StorageConfig
 
 
 ROOT_FIELDS = frozenset({"sensor", "can", "control", "storage"})
 SENSOR_FIELDS = frozenset(SensorConfig.__dataclass_fields__)
 CAN_FIELDS = frozenset(CanConfig.__dataclass_fields__)
 CONTROL_FIELDS = frozenset(ControlConfig.__dataclass_fields__)
+STORAGE_FIELDS = frozenset(StorageConfig.__dataclass_fields__)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -197,7 +219,7 @@ def load_config(path: str | Path) -> AppConfig:
         sensor=_parse_sensor(sections["sensor"]),
         can=_parse_can(sections["can"]),
         control=_parse_control(sections["control"]),
-        storage=sections["storage"],
+        storage=_parse_storage(sections["storage"]),
     )
 
 
@@ -273,6 +295,15 @@ def _parse_control(data: dict[str, Any]) -> ControlConfig:
             name: _number(data, name, positive=True, section="control")
             for name in CONTROL_FIELDS
         }
+    )
+
+
+def _parse_storage(data: dict[str, Any]) -> StorageConfig:
+    """严格解析运行目录；路径的创建延迟到真正写入时。"""
+    _reject_unknown_fields(data, STORAGE_FIELDS, "storage 配置")
+    return StorageConfig(
+        state_dir=_string(data, "state_dir", section="storage"),
+        log_dir=_string(data, "log_dir", section="storage"),
     )
 
 

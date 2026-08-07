@@ -920,6 +920,7 @@ def test_run_cycle_keeps_zero_during_five_second_window_then_allows_fresh_comman
     pump.update_command(PumpCommand(True, 55, 4, 5, 6))
     pump.run_cycle(4.99)
     assert bytes(bus.sent[-1].data) == bytes(8)
+    assert pump.last_sent_command == PumpCommand.safe_stop()
     assert sum(frame.arbitration_id == 0 for frame in bus.sent) == 1
 
     clock.value = 5.0
@@ -929,6 +930,7 @@ def test_run_cycle_keeps_zero_during_five_second_window_then_allows_fresh_comman
     pump.run_cycle(5.0)
     assert bus.sent[-1].arbitration_id == 0x217
     assert bytes(bus.sent[-1].data) == bytes([1, 55, 4, 5, 6, 0, 0, 0])
+    assert pump.last_sent_command == PumpCommand(True, 55, 4, 5, 6)
     assert pump.fault_reason is None
 
     sleeper.release.set()

@@ -43,5 +43,8 @@
     "survey_max_on_s": 1.0,
     "survey_pause_s": 0.5
   },
-  "storage": {}
+  "storage": {
+    "state_dir": "~/.local/state/agv-lift-height-control",
+    "log_dir": "~/.local/state/agv-lift-height-control/logs"
+  }
 }
