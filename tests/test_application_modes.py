@@ -30,6 +30,7 @@ from agv_lift_height_control.runtime_storage import (
     SurveyDraft,
     SurveyDraftStore,
     calibration_fingerprint,
+    lift_calibration_fingerprint,
 )
 
 
@@ -232,7 +233,7 @@ def test_move_requires_final_bundle_before_hardware_factories(tmp_path) -> None:
     assert calls == ["foreground"]
 
 
-def lift_result() -> LiftCalibrationResult:
+def lift_result(*, current_offset=0) -> LiftCalibrationResult:
     trials = tuple(
         LiftTrial(
             pwm=pwm,
@@ -241,14 +242,21 @@ def lift_result() -> LiftCalibrationResult:
             displacement_mm=2.0,
             speed_mm_s=6.0,
             coast_mm=0.5,
-            peak_current_raw=100 + pwm,
+            peak_current_raw=100 + pwm + current_offset,
             direction_consistent=True,
             success=True,
         )
         for pwm in LIFT_PWM_LEVELS
         for repeat in range(1, 4)
     )
-    return LiftCalibrationResult(40, 60, 0.1, 0.5, {p: 100 + p for p in LIFT_PWM_LEVELS}, trials)
+    return LiftCalibrationResult(
+        40,
+        60,
+        0.1,
+        0.5,
+        {p: 100 + p + current_offset for p in LIFT_PWM_LEVELS},
+        trials,
+    )
 
 
 def lower_result() -> LowerCalibrationResult:
@@ -278,8 +286,11 @@ def final_bundle(*, soft_limit=800.0) -> CalibrationBundle:
 def test_confirm_lower_is_hardware_free_and_uses_saved_successful_trial(tmp_path) -> None:
     deps, calls, _pump, _observer, lock = harness(tmp_path, [])
     state = tmp_path / "state"
-    CalibrationDraftStore(state / "lift-calibration-draft.json").save_lift(lift_result())
-    LowerCalibrationDraftStore(state / "lower-calibration-draft.json").save(lower_result())
+    lift = lift_result()
+    CalibrationDraftStore(state / "lift-calibration-draft.json").save_lift(lift)
+    LowerCalibrationDraftStore(state / "lower-calibration-draft.json").save(
+        lower_result(), lift_fingerprint=lift_calibration_fingerprint(lift)
+    )
 
     run_application(
         arguments(tmp_path, "confirm-lower", comfortable_valve=0x50),
@@ -289,6 +300,27 @@ def test_confirm_lower_is_hardware_free_and_uses_saved_successful_trial(tmp_path
     assert calls == []
     assert lock.acquired == lock.released == 1
     assert CalibrationStore(state / "calibration.json").load().lower_comfortable_valve == 0x50
+
+
+def test_confirm_lower_rejects_when_lift_draft_changed_after_lower_measurement(tmp_path) -> None:
+    deps, calls, _pump, _observer, _lock = harness(tmp_path, [])
+    state = tmp_path / "state"
+    lift_store = CalibrationDraftStore(state / "lift-calibration-draft.json")
+    lift_a = lift_result(current_offset=0)
+    lift_store.save_lift(lift_a)
+    LowerCalibrationDraftStore(state / "lower-calibration-draft.json").save(
+        lower_result(), lift_fingerprint=lift_calibration_fingerprint(lift_a)
+    )
+    lift_store.save_lift(lift_result(current_offset=1))
+
+    with pytest.raises(CalibrationError, match="起升标定.*不匹配"):
+        run_application(
+            arguments(tmp_path, "confirm-lower", comfortable_valve=0x50),
+            dependencies=deps,
+        )
+
+    assert calls == []
+    assert not (state / "calibration.json").exists()
 
 
 def test_confirm_upper_is_hardware_free_and_rejects_value_above_safe_suggestion(tmp_path) -> None:

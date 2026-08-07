@@ -45,6 +45,7 @@ from .runtime_storage import (
     SurveyDraft,
     SurveyDraftStore,
     calibration_fingerprint,
+    lift_calibration_fingerprint,
 )
 from .types import HeightSample, PumpCommand, PumpFeedback
 
@@ -825,7 +826,10 @@ def _run_confirmation(
 ) -> int:
     if args.command == "confirm-lower":
         lift = lift_draft_store.load_lift()
-        lower = lower_draft_store.load().confirm_comfortable(args.comfortable_valve)
+        lower_draft = lower_draft_store.load()
+        if lower_draft.lift_fingerprint != lift_calibration_fingerprint(lift):
+            raise CalibrationError("下降草稿所依据的起升标定与当前起升标定不匹配，禁止确认")
+        lower = lower_draft.result.confirm_comfortable(args.comfortable_valve)
         calibration_store.save(CalibrationBundle.from_results(lift, lower))
         print(f"已确认舒适下降阀值: 0x{args.comfortable_valve:02X}", file=stdout)
         return 0
@@ -909,7 +913,10 @@ def _run_mode(
         if not source.session.done:
             raise RuntimeError("下降标定未完成，未保存下降草稿")
         lower = analyze_lower_trials(source.session.trials)
-        lower_draft_store.save(lower)
+        lower_draft_store.save(
+            lower,
+            lift_fingerprint=lift_calibration_fingerprint(lift_draft),
+        )
         candidates = sorted(
             trial.valve
             for trial in lower.trials

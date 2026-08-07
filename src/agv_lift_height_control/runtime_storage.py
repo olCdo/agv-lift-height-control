@@ -141,8 +141,20 @@ def _result_from_json(raw: object) -> LiftCalibrationResult:
     return _validate_result(result)
 
 
-LOWER_DRAFT_SCHEMA_VERSION = 1
+LOWER_DRAFT_SCHEMA_VERSION = 2
 SURVEY_DRAFT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class LowerCalibrationDraft:
+    """下降试验结果及其所依据的完整起升标定指纹。"""
+
+    result: LowerCalibrationResult
+    lift_fingerprint: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "result", _validate_lower_result(self.result))
+        _validate_fingerprint("lift_fingerprint", self.lift_fingerprint)
 
 
 class LowerCalibrationDraftStore:
@@ -151,13 +163,14 @@ class LowerCalibrationDraftStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
-    def save(self, result: LowerCalibrationResult) -> None:
-        validated = _validate_lower_result(result)
+    def save(self, result: LowerCalibrationResult, *, lift_fingerprint: str) -> None:
+        draft = LowerCalibrationDraft(result=result, lift_fingerprint=lift_fingerprint)
         raw = {
             "schema_version": LOWER_DRAFT_SCHEMA_VERSION,
             "lower": {
-                "min_start_valve": validated.min_start_valve,
+                "min_start_valve": draft.result.min_start_valve,
                 "comfortable_valve": None,
+                "lift_fingerprint": draft.lift_fingerprint,
                 "trials": [
                     {
                         "valve": trial.valve,
@@ -166,26 +179,33 @@ class LowerCalibrationDraftStore:
                         "direction_consistent": trial.direction_consistent,
                         "success": trial.success,
                     }
-                    for trial in validated.trials
+                    for trial in draft.result.trials
                 ],
             },
         }
         _atomic_json_save(self.path, raw, "下降标定草稿")
 
-    def load(self) -> LowerCalibrationResult:
+    def load(self) -> LowerCalibrationDraft:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise CalibrationError(f"无法读取下降标定草稿: {exc}") from exc
         if type(raw) is not dict or set(raw) != {"schema_version", "lower"}:
             raise CalibrationError("下降草稿字段不完整或包含未知字段")
-        if (
-            type(raw["schema_version"]) is not int
-            or raw["schema_version"] != LOWER_DRAFT_SCHEMA_VERSION
-        ):
+        schema_version = raw["schema_version"]
+        if type(schema_version) is not int:
+            raise CalibrationError("不支持的下降草稿 schema_version")
+        if schema_version == 1:
+            raise CalibrationError("旧版下降草稿缺少起升指纹；请重新执行下降标定")
+        if schema_version != LOWER_DRAFT_SCHEMA_VERSION:
             raise CalibrationError("不支持的下降草稿 schema_version")
         lower = raw["lower"]
-        expected = {"min_start_valve", "comfortable_valve", "trials"}
+        expected = {
+            "min_start_valve",
+            "comfortable_valve",
+            "lift_fingerprint",
+            "trials",
+        }
         if type(lower) is not dict or set(lower) != expected:
             raise CalibrationError("下降草稿 lower 字段不完整或包含未知字段")
         if lower["comfortable_valve"] is not None:
@@ -213,7 +233,10 @@ class LowerCalibrationDraftStore:
             )
         except (TypeError, ValueError) as exc:
             raise CalibrationError(f"下降草稿字段类型错误: {exc}") from exc
-        return _validate_lower_result(result)
+        return LowerCalibrationDraft(
+            result=result,
+            lift_fingerprint=lower["lift_fingerprint"],
+        )
 
 
 def _validate_lower_result(result: object) -> LowerCalibrationResult:
@@ -317,6 +340,29 @@ def calibration_fingerprint(bundle: CalibrationBundle) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return sha256(canonical).hexdigest()
+
+
+def lift_calibration_fingerprint(result: LiftCalibrationResult) -> str:
+    """对规范化后的完整起升标定结果计算稳定 SHA-256 指纹。"""
+
+    validated = _validate_result(result)
+    canonical = json.dumps(
+        _result_to_json(validated)["lift"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(canonical).hexdigest()
+
+
+def _validate_fingerprint(name: str, fingerprint: object) -> None:
+    if (
+        type(fingerprint) is not str
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise CalibrationError(f"{name} 必须是 SHA-256 小写十六进制")
 
 
 def _atomic_json_save(path: Path, raw: dict[str, Any], label: str) -> None:

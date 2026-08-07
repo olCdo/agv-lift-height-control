@@ -52,9 +52,11 @@ from .operator_runtime import (
 from .passive_can import PassiveCanObserver
 from .runtime_storage import (
     CalibrationDraftStore,
+    LowerCalibrationDraft,
     LowerCalibrationDraftStore,
     SurveyDraft,
     SurveyDraftStore,
+    lift_calibration_fingerprint,
 )
 from .simulation import HydraulicLiftSimulator, HydraulicSnapshot
 from .types import HeightSample, HeightSource, PumpCommand, PumpFeedback
@@ -91,6 +93,7 @@ __all__ = [
     "LiftCalibrationSession",
     "LiftTrial",
     "LowerCalibrationResult",
+    "LowerCalibrationDraft",
     "LowerCalibrationDraftStore",
     "LowerCalibrationSession",
     "LowerTrial",
@@ -110,6 +113,7 @@ __all__ = [
     "encode_pump_command",
     "inspect_can_link",
     "load_config",
+    "lift_calibration_fingerprint",
     "parse_pump_feedback",
     "select_safe_command",
     "validate_foreground_terminal",

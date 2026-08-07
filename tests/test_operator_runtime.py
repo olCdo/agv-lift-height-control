@@ -35,6 +35,7 @@ from agv_lift_height_control.runtime_storage import (
     SurveyDraft,
     SurveyDraftStore,
     calibration_fingerprint,
+    lift_calibration_fingerprint,
 )
 
 
@@ -291,12 +292,30 @@ def _bundle() -> CalibrationBundle:
 
 def test_lower_draft_roundtrip_preserves_all_trials_without_comfort_guess(tmp_path) -> None:
     store = LowerCalibrationDraftStore(tmp_path / "lower-draft.json")
+    fingerprint = lift_calibration_fingerprint(_lift_result())
 
-    store.save(_lower_result())
+    store.save(_lower_result(), lift_fingerprint=fingerprint)
     loaded = store.load()
 
-    assert loaded == _lower_result()
-    assert loaded.comfortable_valve is None
+    assert loaded.result == _lower_result()
+    assert loaded.result.comfortable_valve is None
+    assert loaded.lift_fingerprint == fingerprint
+
+
+def test_old_lower_draft_without_lift_fingerprint_is_explicitly_rejected(tmp_path) -> None:
+    path = tmp_path / "lower-draft.json"
+    store = LowerCalibrationDraftStore(path)
+    store.save(
+        _lower_result(),
+        lift_fingerprint=lift_calibration_fingerprint(_lift_result()),
+    )
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["schema_version"] = 1
+    raw["lower"].pop("lift_fingerprint")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(CalibrationError, match="旧版.*起升指纹"):
+        store.load()
 
 
 def test_survey_draft_roundtrip_binds_recommendation_to_calibration_fingerprint(tmp_path) -> None:
