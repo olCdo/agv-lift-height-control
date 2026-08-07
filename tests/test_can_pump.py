@@ -358,6 +358,27 @@ def test_parse_feedback_extracts_little_endian_fields_and_local_timestamp() -> N
 
 
 @pytest.mark.parametrize(
+    ("current_bytes", "expected_current"),
+    [
+        (bytes((0xFD, 0xFF)), -3),
+        (bytes((0xFA, 0xFF)), -6),
+    ],
+)
+def test_parse_feedback_treats_motor_current_as_signed_16_bit(
+    current_bytes: bytes, expected_current: int
+) -> None:
+    """零电流附近的负偏置必须保留符号，不能显示成 65533 一类大电流。"""
+    frame = FakeMessage(
+        0x197,
+        bytes((0x10, 0, 0, current_bytes[0], current_bytes[1], 0x52, 0xFF, 0)),
+    )
+
+    feedback = api("parse_pump_feedback")(frame, timestamp=1.0)
+
+    assert feedback.current_raw == expected_current
+
+
+@pytest.mark.parametrize(
     "frame",
     [
         FakeMessage(0x198, bytes(8)),

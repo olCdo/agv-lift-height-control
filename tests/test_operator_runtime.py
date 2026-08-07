@@ -22,6 +22,7 @@ from agv_lift_height_control.operator_runtime import (
     EOF_EVENT,
     CsvEventLogger,
     DeadmanAuthorizer,
+    PosixAnsiTerminal,
     RuntimeSnapshot,
     SensorWorker,
     ShutdownLatch,
@@ -140,6 +141,42 @@ def test_foreground_terminal_rejects_background_process_group_and_empty_tmux_mar
 def test_terminal_events_preserve_each_character_and_eof() -> None:
     assert TerminalEvent.keypress("u") != TerminalEvent.keypress("u")
     assert EOF_EVENT.kind == "eof"
+
+
+def test_tui_render_clears_every_line_before_writing_shorter_values() -> None:
+    """每行都要先清除，否则 SSH 终端会把旧的第三位残留到新两位故障码后。"""
+    output = io.StringIO()
+    terminal = PosixAnsiTerminal(stdout=output)
+
+    terminal.render(
+        RuntimeSnapshot(
+            mode="observe-can",
+            feedback=PumpFeedback(1.0, -3, 0x52, 0),
+        )
+    )
+
+    rendered_lines = (
+        output.getvalue()
+        .removeprefix("\x1b[H")
+        .removesuffix("\x1b[J")
+        .split("\n")
+    )
+    assert rendered_lines
+    assert all(line.startswith("\x1b[2K") for line in rendered_lines)
+
+
+def test_tui_render_shows_fault_code_in_protocol_hex_and_decimal() -> None:
+    output = io.StringIO()
+    terminal = PosixAnsiTerminal(stdout=output)
+
+    terminal.render(
+        RuntimeSnapshot(
+            mode="observe-can",
+            feedback=PumpFeedback(1.0, -3, 0x52, 0),
+        )
+    )
+
+    assert "故障码: 0x52 (82)" in output.getvalue()
 
 
 class ScriptedSource:

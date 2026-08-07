@@ -129,13 +129,16 @@ class PosixAnsiTerminal:
             f"归零请求={'是' if snapshot.zero_requested else '否'}",
             f"泵电流: {_show(feedback.current_raw if feedback else None)}    "
             f"下降电流: {_show(feedback.lower_current_raw if feedback else None)}    "
-            f"故障码: {_show(feedback.fault_code if feedback else None)}",
+            f"故障码: {_show_fault_code(feedback.fault_code if feedback else None)}",
             f"控制故障: {snapshot.controller_fault or '-'}",
             f"CAN泵状态: {snapshot.pump_fault or '-'}",
             f"授权剩余: 起升 {snapshot.lift_remaining_ms} ms / 下降 {snapshot.lower_remaining_ms} ms",
             "操作: u 起升续期700ms | d 下降续期150ms | c 请求清故障 | q 安全退出",
         )
-        self.stdout.write("\x1b[H" + "\n".join(lines) + "\x1b[J")
+        # 光标回到左上角后逐行清除旧内容；只在最后使用 ``J`` 无法清掉前面
+        # 各行右侧的残留字符，例如故障码从三位缩短成两位时会伪装成三位数。
+        cleared_lines = "\n".join(f"\x1b[2K{line}" for line in lines)
+        self.stdout.write("\x1b[H" + cleared_lines + "\x1b[J")
         self.stdout.flush()
 
     def close(self) -> None:
@@ -155,6 +158,11 @@ class PosixAnsiTerminal:
 
 def _show(value: object) -> str:
     return "-" if value is None else str(value)
+
+
+def _show_fault_code(value: int | None) -> str:
+    """同时显示协议手册使用的十六进制和便于日志检索的十进制。"""
+    return "-" if value is None else f"0x{value:02X} ({value})"
 
 
 class DeadmanAuthorizer:

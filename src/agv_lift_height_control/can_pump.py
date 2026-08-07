@@ -129,7 +129,11 @@ def parse_pump_feedback(
     *,
     timestamp: float,
 ) -> PumpFeedback:
-    """解析标准数据帧 0x197，并使用本机单调时钟标记接收时刻。"""
+    """解析标准数据帧 0x197，并使用本机单调时钟标记接收时刻。
+
+    泵电机电流位于 Byte3..4，采用小端有符号 16 位；零输出时出现的轻微
+    负偏置必须保留符号，避免 ``0xFFFD`` 被误报为 65533。
+    """
     if type(timestamp) not in {int, float} or not isfinite(float(timestamp)) or timestamp < 0:
         raise ValueError("timestamp 必须是有限且非负的本机单调时钟值")
     if type(getattr(frame, "arbitration_id", None)) is not int:
@@ -151,7 +155,7 @@ def parse_pump_feedback(
         raise ValueError("反馈帧包含异常字节")
     return PumpFeedback(
         timestamp=float(timestamp),
-        current_raw=data[3] | (data[4] << 8),
+        current_raw=int.from_bytes(bytes(data[3:5]), "little", signed=True),
         fault_code=data[5],
         lower_current_raw=data[7],
     )
