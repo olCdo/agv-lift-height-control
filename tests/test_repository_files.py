@@ -19,4 +19,8 @@ def test_gitignore_keeps_example_but_excludes_runtime_data() -> None:
     assert not is_ignored("config/example.json")
     assert is_ignored("calibration-lift.json")
     assert is_ignored("state-height.json")
+    assert is_ignored("lift-calibration-draft.json")
+    assert is_ignored("lower-calibration-draft.json")
+    assert is_ignored("upper-survey-draft.json")
+    assert is_ignored("agv-lift-height-control.lock")
     assert is_ignored("height-log.csv")

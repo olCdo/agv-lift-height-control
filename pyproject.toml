@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "agv-lift-height-control"
 version = "0.1.0"
 description = "AGV lift height control foundation"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pymodbus>=3.6,<4",
@@ -13,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7,<9"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
