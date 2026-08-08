@@ -18,6 +18,7 @@ from .calibration import (
     CalibrationStore,
     LiftCalibrationSession,
     LowerCalibrationSession,
+    PrepareLowerSession,
     UpperLimitSurvey,
     analyze_lift_trials,
     analyze_lower_trials,
@@ -189,6 +190,36 @@ class LowerCalibrationCommandSource:
     def close(self) -> None:
         if self.controller is not None:
             self.controller.exit_external_mode()
+
+
+class PrepareLowerCommandSource:
+    """把纯预升会话适配为前台运行时命令源。"""
+
+    allow_lift = True
+    allow_lower = False
+    controller = None
+
+    def __init__(self, session: PrepareLowerSession) -> None:
+        self.session = session
+        # 预升没有最终CalibrationBundle，运行快照从此状态对象读取目标和故障。
+        self.status = session
+
+    def step(
+        self, now, sample, feedback, lift_authorized, lower_authorized
+    ) -> CommandDecision:
+        if sample is None or feedback is None:
+            return CommandDecision(PumpCommand.safe_stop())
+        command = self.session.step(
+            now=now,
+            sample=sample,
+            feedback=feedback,
+            lift_authorized=lift_authorized,
+        )
+        return CommandDecision(
+            command,
+            done=self.session.done,
+            fatal_reason=self.session.fault_reason if self.session.failed else None,
+        )
 
 
 class SurveyCommandSource:
@@ -638,8 +669,9 @@ class ForegroundRuntime:
         desired_command,
     ) -> RuntimeSnapshot:
         controller = getattr(source, "controller", None)
-        target = getattr(controller, "target_mm", None)
-        state = getattr(controller, "state", None)
+        status = controller or getattr(source, "status", None)
+        target = getattr(status, "target_mm", None)
+        state = getattr(status, "state", None)
         state_text = getattr(state, "value", str(state) if state is not None else None)
         height = sample.height_mm if sample is not None else None
         error = target - height if target is not None and height is not None else None
@@ -657,7 +689,7 @@ class ForegroundRuntime:
             lower_authorized=self.authorizer.lower_authorized,
             lift_remaining_ms=self.authorizer.lift_remaining_ms,
             lower_remaining_ms=self.authorizer.lower_remaining_ms,
-            controller_fault=getattr(controller, "fault_reason", None),
+            controller_fault=getattr(status, "fault_reason", None),
             pump_fault=getattr(self.pump, "fault_reason", None),
         )
 
@@ -892,12 +924,21 @@ def _run_mode(
 ) -> int:
     mode = args.command
     # 下降阶段必须先验证跨进程草稿，再创建日志、串口或 CAN；坏草稿绝不进入现场动作。
-    lift_draft = draft_store.load_lift() if mode == "calibrate-lower" else None
+    lift_draft = (
+        draft_store.load_lift()
+        if mode in {"calibrate-lower", "prepare-lower"}
+        else None
+    )
     if mode in {"monitor", "observe-can", "zero-can"}:
         source = ZeroCommandSource()
     else:
         # 控制模式先验证草稿/最终标定及目标边界，失败时不构造硬件工厂。
-        source = _build_control_source(args, config, calibration_store)
+        source = _build_control_source(
+            args,
+            config,
+            calibration_store,
+            lift_draft=lift_draft,
+        )
     terminal = deps.terminal_factory()
     logger = deps.logger_factory(config.storage.log_dir, mode)
     worker = None
@@ -939,6 +980,16 @@ def _run_mode(
         if not source.session.done:
             raise RuntimeError("起升标定未完成，未保存草稿")
         draft_store.save_lift(analyze_lift_trials(source.session.trials))
+    elif mode == "prepare-lower":
+        if not source.session.done or source.session.final_height_mm is None:
+            raise RuntimeError("下降标定预升未完成")
+        print(
+            f"预升完成，最终传感器高度: {source.session.final_height_mm:g} mm",
+            file=deps.stdout,
+        )
+        log_path = getattr(logger, "path", None)
+        if log_path is not None:
+            print(f"CSV日志: {log_path}", file=deps.stdout)
     elif mode == "calibrate-lower":
         if not source.session.done:
             raise RuntimeError("下降标定未完成，未保存下降草稿")
@@ -975,7 +1026,13 @@ def _run_mode(
     return 0
 
 
-def _build_control_source(args, config: AppConfig, calibration_store: CalibrationStore):
+def _build_control_source(
+    args,
+    config: AppConfig,
+    calibration_store: CalibrationStore,
+    *,
+    lift_draft=None,
+):
     if args.command == "calibrate-lift":
         temporary = getattr(args, "temporary_max_mm", None)
         if temporary is None:
@@ -1008,6 +1065,31 @@ def _build_control_source(args, config: AppConfig, calibration_store: Calibratio
                 absolute_max_height_mm=config.control.absolute_max_height_mm,
             ),
             controller=controller,
+        )
+
+    if args.command == "prepare-lower":
+        if lift_draft is None:
+            raise CalibrationError("预升必须先读取有效起升标定草稿")
+        limits = [
+            float(args.temporary_max_mm),
+            config.control.absolute_max_height_mm,
+            2900.0,
+        ]
+        if calibration_store.path.exists():
+            persistent = calibration_store.load().soft_upper_limit_mm
+            if persistent is not None:
+                limits.append(persistent)
+        return PrepareLowerCommandSource(
+            PrepareLowerSession(
+                lift_draft,
+                target_mm=args.target_mm,
+                effective_max_height_mm=min(limits),
+                direction_tolerance_mm=config.control.direction_tolerance_mm,
+                sensor_timeout_s=config.control.sensor_timeout_s,
+                feedback_timeout_s=config.can.feedback_timeout_s,
+                current_multiplier=config.control.current_multiplier,
+                current_duration_s=config.control.current_duration_s,
+            )
         )
 
     bundle = calibration_store.load()

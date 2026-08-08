@@ -4,7 +4,12 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from agv_lift_height_control import HeightSample, PumpCommand, PumpFeedback
+from agv_lift_height_control import (
+    HeightSample,
+    PrepareLowerState,
+    PumpCommand,
+    PumpFeedback,
+)
 from agv_lift_height_control.application import (
     CommandDecision,
     ForegroundRuntime,
@@ -529,6 +534,32 @@ def test_csv_and_tui_snapshot_use_can_pump_last_sent_command_not_desired() -> No
 
     assert any(command.lift_pwm == 40 for action, command in pump.actions if action == "update")
     assert logger.cycles[0].command == PumpCommand.safe_stop()
+
+
+def test_prepare_lower_status_source_populates_target_state_and_fault_snapshot() -> None:
+    source = SimpleNamespace(
+        controller=None,
+        status=SimpleNamespace(
+            target_mm=100.0,
+            state=PrepareLowerState.SETTLE,
+            fault_reason="预升测试故障",
+        ),
+    )
+    foreground = runtime()
+    foreground.mode = "prepare-lower"
+
+    value = foreground._snapshot(
+        source,
+        HeightSample(1.0, 20, 20.0, True, None),
+        PumpFeedback(1.0, 0, 0, 0),
+        PumpCommand.safe_stop(),
+        PumpCommand.safe_stop(),
+    )
+
+    assert value.target_mm == 100.0
+    assert value.target_error_mm == 80.0
+    assert value.controller_state == "停泵观察"
+    assert value.controller_fault == "预升测试故障"
 
 
 def test_exit_event_is_written_after_pump_stop_with_last_actual_command() -> None:

@@ -22,6 +22,7 @@ from agv_lift_height_control.calibration import (
     LiftTrial,
     LowerCalibrationResult,
     LowerTrial,
+    PrepareLowerState,
 )
 from agv_lift_height_control.operator_runtime import TerminalEvent
 from agv_lift_height_control.runtime_storage import (
@@ -222,6 +223,17 @@ def test_calibrate_lower_requires_valid_lift_draft_before_hardware_factories(tmp
     assert calls == ["foreground"]
 
 
+def test_prepare_lower_requires_lift_draft_before_hardware_factories(tmp_path) -> None:
+    deps, calls, _pump, _observer, _lock = harness(
+        tmp_path, [TerminalEvent.keypress("q")]
+    )
+
+    with pytest.raises(CalibrationError, match="草稿"):
+        run_application(arguments(tmp_path, "prepare-lower"), dependencies=deps)
+
+    assert calls == ["foreground"]
+
+
 def test_move_requires_final_bundle_before_hardware_factories(tmp_path) -> None:
     deps, calls, _pump, _observer, _lock = harness(
         tmp_path, [TerminalEvent.keypress("q")]
@@ -280,6 +292,89 @@ def final_bundle(*, soft_limit=800.0) -> CalibrationBundle:
         0x50,
         soft_limit,
     )
+
+
+def test_prepare_lower_builds_from_draft_without_final_bundle(tmp_path) -> None:
+    config_file = config_path(tmp_path)
+    config = load_config(config_file)
+    store = CalibrationStore(tmp_path / "state" / "calibration.json")
+    lift = lift_result()
+
+    source = _build_control_source(
+        Namespace(
+            command="prepare-lower",
+            target_mm=100.0,
+            temporary_max_mm=200.0,
+        ),
+        config,
+        store,
+        lift_draft=lift,
+    )
+
+    assert source.allow_lift is True
+    assert source.allow_lower is False
+    assert source.session.target_mm == 100.0
+    assert source.session.effective_max_height_mm == 200.0
+    assert source.session._pwm == 40
+
+
+def test_prepare_lower_effective_limit_uses_persistent_soft_limit(tmp_path) -> None:
+    config_file = config_path(tmp_path)
+    config = load_config(config_file)
+    store = CalibrationStore(tmp_path / "state" / "calibration.json")
+    store.save(final_bundle(soft_limit=150.0))
+
+    source = _build_control_source(
+        Namespace(
+            command="prepare-lower",
+            target_mm=100.0,
+            temporary_max_mm=200.0,
+        ),
+        config,
+        store,
+        lift_draft=lift_result(),
+    )
+
+    assert source.session.effective_max_height_mm == 150.0
+
+
+def test_prepare_lower_reports_completion_without_rewriting_lift_draft(
+    tmp_path, monkeypatch
+) -> None:
+    deps, _calls, _pump, _observer, _lock = harness(tmp_path, [])
+    state = tmp_path / "state"
+    draft_path = state / "lift-calibration-draft.json"
+    CalibrationDraftStore(draft_path).save_lift(lift_result())
+    before = draft_path.read_bytes()
+    logger = Logger()
+    logger.path = tmp_path / "logs" / "prepare-lower.csv"
+    deps.logger_factory = lambda _path, _mode: logger
+
+    def complete(_runtime, source, *, duration_s=None):
+        assert duration_s == 60.0
+        source.session._started_output = True
+        source.session.final_height_mm = 100.2
+        source.session.state = PrepareLowerState.DONE
+
+    monkeypatch.setattr(
+        "agv_lift_height_control.application.ForegroundRuntime.run", complete
+    )
+
+    result = run_application(
+        arguments(
+            tmp_path,
+            "prepare-lower",
+            target_mm=100.0,
+            temporary_max_mm=200.0,
+        ),
+        dependencies=deps,
+    )
+
+    assert result == 0
+    assert "最终传感器高度: 100.2 mm" in deps.stdout.getvalue()
+    assert "prepare-lower.csv" in deps.stdout.getvalue()
+    assert draft_path.read_bytes() == before
+    assert not (state / "lower-calibration-draft.json").exists()
 
 
 def test_confirm_lower_is_hardware_free_and_uses_saved_successful_trial(tmp_path) -> None:
