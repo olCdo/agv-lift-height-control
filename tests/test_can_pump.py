@@ -13,7 +13,7 @@ import pytest
 
 import agv_lift_height_control as package
 import agv_lift_height_control.can_pump as can_module
-from agv_lift_height_control import CanConfig, PumpCommand, PumpFeedback
+from agv_lift_height_control import CanConfig, EmergencyStopLatch, PumpCommand, PumpFeedback
 
 
 def api(name: str) -> Any:
@@ -315,6 +315,7 @@ def make_pump(
     sleeper: ControlledSleeper | None = None,
     config: CanConfig | None = None,
     factory=message_factory,
+    emergency_stop: EmergencyStopLatch | None = None,
 ):
     clock = clock or ManualClock()
     sleeper = sleeper or ControlledSleeper(clock)
@@ -326,6 +327,7 @@ def make_pump(
         clock=clock,
         sleeper=sleeper,
         link_checker=lambda interface, bitrate: None,
+        emergency_stop=emergency_stop,
     )
     return pump, clock, sleeper
 
@@ -993,6 +995,94 @@ def test_run_cycle_keeps_zero_during_five_second_window_then_allows_fresh_comman
     pump.stop()
 
 
+def test_emergency_stop_forces_next_cycle_zero_after_nonzero_command_was_sent() -> None:
+    bus = FakeBus()
+    clock = ManualClock(5.0)
+    emergency_stop = EmergencyStopLatch(clock=clock)
+    pump, _, _ = make_pump(bus, clock=clock, emergency_stop=emergency_stop)
+    pump._bus = bus
+    pump._running = True
+    pump._started_at = 0.0
+    pump._nmt_sent = True
+    pump._last_feedback = PumpFeedback(5.0, 1, 0, 2)
+
+    pump.update_command(PumpCommand(True, 0x50, 4, 5, 6))
+    assert pump.run_cycle(5.0).lift_pwm == 0x50
+
+    emergency_stop.trigger("上限开关触发")
+    command = pump.run_cycle(5.01)
+
+    assert command == PumpCommand.safe_stop()
+    assert bytes(bus.sent[-1].data) == bytes(8)
+    assert pump.fault_reason == "急停锁存: 上限开关触发"
+
+
+def test_update_command_discards_nonzero_while_emergency_stop_is_active() -> None:
+    bus = FakeBus()
+    clock = ManualClock(1.0)
+    emergency_stop = EmergencyStopLatch(clock=clock)
+    pump, _, _ = make_pump(bus, clock=clock, emergency_stop=emergency_stop)
+    pump._bus = bus
+    pump._running = True
+    pump._started_at = 0.0
+    pump._nmt_sent = True
+    emergency_stop.trigger("操作员急停")
+
+    pump.update_command(PumpCommand(True, 80, 4, 5, 6))
+    pump.run_cycle(1.0)
+    emergency_stop.clear()
+
+    assert emergency_stop.snapshot().active is False
+    assert pump.desired_command == PumpCommand.safe_stop()
+
+
+def test_emergency_stop_reason_has_priority_over_all_ordinary_can_gates() -> None:
+    bus = FakeBus()
+    clock = ManualClock(1.0)
+    emergency_stop = EmergencyStopLatch(clock=clock)
+    pump, _, _ = make_pump(bus, clock=clock, emergency_stop=emergency_stop)
+    pump._bus = bus
+    pump._running = True
+    pump._started_at = 0.9
+    pump._nmt_sent = False
+    pump._desired = PumpCommand(True, 80, 4, 5, 6)
+    pump._desired_updated_at = 0.0
+    pump._last_feedback = None
+    pump._thread_fault = "CAN 接收线程异常: 原有故障"
+    emergency_stop.trigger("安全回路断开")
+
+    command = pump.run_cycle(1.0)
+
+    assert command == PumpCommand.safe_stop()
+    assert [frame.arbitration_id for frame in bus.sent] == [0x000, 0x217]
+    assert pump.fault_reason == "急停锁存: 安全回路断开"
+
+
+def test_active_send_failure_latches_transport_fault_without_automatic_recovery() -> None:
+    bus = FakeBus(fail_send_numbers={1})
+    clock = ManualClock(1.0)
+    emergency_stop = EmergencyStopLatch(clock=clock)
+    pump, _, _ = make_pump(bus, clock=clock, emergency_stop=emergency_stop)
+    pump._bus = bus
+    pump._running = True
+    pump._started_at = 0.0
+    pump._nmt_sent = True
+    emergency_stop.trigger("安全回路断开")
+
+    with pytest.raises(OSError, match="simulated CAN send failure"):
+        pump.run_cycle(1.0)
+    transport_fault = emergency_stop.snapshot().transport_fault
+
+    pump.run_cycle(1.01)
+
+    snapshot = emergency_stop.snapshot()
+    assert transport_fault == "simulated CAN send failure"
+    assert snapshot.transport_fault == transport_fault
+    assert snapshot.zero_sent_after_trigger is True
+    with pytest.raises(RuntimeError, match="传输正常"):
+        emergency_stop.clear()
+
+
 def test_run_cycle_timestamps_after_atomic_feedback_snapshot() -> None:
     """接收线程在状态锁边界提交反馈时，发送周期不得使用更早的时间。"""
     bus = FakeBus()
@@ -1174,6 +1264,38 @@ def test_stop_is_idempotent_and_sends_configured_zero_frames_before_shutdown() -
         for frame in bus.send_attempts[-4:]
     )
     assert bus.shutdown_calls == 1
+
+
+def test_stop_zero_frame_is_post_trigger_send_evidence() -> None:
+    bus = FakeBus()
+    clock = ManualClock(1.0)
+    emergency_stop = EmergencyStopLatch(clock=clock)
+    pump, _, _ = make_pump(bus, clock=clock, emergency_stop=emergency_stop)
+    pump._bus = bus
+    pump._running = True
+    emergency_stop.trigger("操作员急停")
+
+    pump.stop()
+    emergency_stop.clear()
+
+    assert emergency_stop.snapshot().active is False
+    assert all(bytes(frame.data) == bytes(8) for frame in bus.sent)
+
+
+def test_stop_zero_frame_failure_latches_transport_fault() -> None:
+    bus = FakeBus(fail_send_numbers={1, 2, 3})
+    clock = ManualClock(1.0)
+    emergency_stop = EmergencyStopLatch(clock=clock)
+    pump, _, _ = make_pump(bus, clock=clock, emergency_stop=emergency_stop)
+    pump._bus = bus
+    pump._running = True
+    emergency_stop.trigger("操作员急停")
+
+    pump.stop()
+
+    snapshot = emergency_stop.snapshot()
+    assert snapshot.zero_sent_after_trigger is False
+    assert snapshot.transport_fault == "simulated CAN send failure"
 
 
 def test_context_manager_stops_and_zeroes_when_body_raises() -> None:

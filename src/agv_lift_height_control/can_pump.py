@@ -16,6 +16,7 @@ from time import monotonic, sleep
 from typing import Any
 
 from .config import CanConfig
+from .emergency_stop import EmergencyStopLatch
 from .types import PumpCommand, PumpFeedback
 
 
@@ -226,6 +227,7 @@ class CanPump:
         clock: Callable[[], float] = monotonic,
         sleeper: Callable[[float], None] = sleep,
         link_checker: Callable[[str, int], Any] = inspect_can_link,
+        emergency_stop: EmergencyStopLatch | None = None,
     ) -> None:
         self._config = config
         self._bus_factory = bus_factory or _create_socketcan_bus
@@ -233,6 +235,7 @@ class CanPump:
         self._clock = clock
         self._sleeper = sleeper
         self._link_checker = link_checker
+        self.emergency_stop = emergency_stop or EmergencyStopLatch(clock=clock)
 
         self._state_lock = RLock()
         self._lifecycle_lock = Lock()
@@ -292,6 +295,9 @@ class CanPump:
         if not isinstance(command, PumpCommand):
             raise TypeError("command 必须是 PumpCommand")
         timestamp = self._clock()
+        if self.emergency_stop.snapshot().active:
+            # 急停期间连期望槽也保持全零，避免解除后把锁存前或锁存中的旧命令重新发出。
+            command = PumpCommand.safe_stop()
         with self._state_lock:
             self._desired = command
             self._desired_updated_at = timestamp
@@ -432,15 +438,24 @@ class CanPump:
                 raise ValueError("now 必须是有限数字")
             timestamp = float(timestamp)
 
-            command, reason = select_safe_command(
-                config=self._config,
-                now=timestamp,
-                started_at=started_at,
-                desired=desired,
-                desired_updated_at=desired_updated_at,
-                feedback=feedback,
-                thread_fault=thread_fault,
-            )
+            emergency_snapshot = self.emergency_stop.snapshot()
+            if emergency_snapshot.active:
+                # 急停是命令选择的最高优先级：普通 NMT、反馈、超时和线程故障门禁
+                # 只能补充诊断，不能覆盖事故首因，也不能让任何非零期望穿透。
+                command = PumpCommand.safe_stop()
+                reason = f"急停锁存: {emergency_snapshot.reason}"
+                with self._state_lock:
+                    self._desired = command
+            else:
+                command, reason = select_safe_command(
+                    config=self._config,
+                    now=timestamp,
+                    started_at=started_at,
+                    desired=desired,
+                    desired_updated_at=desired_updated_at,
+                    feedback=feedback,
+                    thread_fault=thread_fault,
+                )
             with self._state_lock:
                 self._fault_reason = reason
 
@@ -448,7 +463,7 @@ class CanPump:
                 self._send_payload(bus, self._config.nmt_id, encode_nmt_start())
                 with self._state_lock:
                     self._nmt_sent = True
-            self._send_payload(bus, self._config.command_id, encode_pump_command(command))
+            self._send_command(bus, command)
             with self._state_lock:
                 self._last_sent_command = command
             return command
@@ -613,11 +628,10 @@ class CanPump:
     def _send_shutdown_zero_frames(self, bus: Any) -> None:
         """逐帧尽力发送；一次失败不阻止后续零帧尝试。"""
         safe_stop = PumpCommand.safe_stop()
-        payload = encode_pump_command(safe_stop)
         sent = False
         for _ in range(self._config.shutdown_zero_frames):
             try:
-                self._send_payload(bus, self._config.command_id, payload)
+                self._send_command(bus, safe_stop)
                 sent = True
             except Exception:
                 pass
@@ -639,16 +653,29 @@ class CanPump:
             # 无法确认线程已结束时必须按仍存活处理，避免清停止事件导致跨代复活。
             return True
 
+    def _send_command(self, bus: Any, command: PumpCommand) -> None:
+        """同步发送 0x217；仅在 ``bus.send`` 成功返回后登记命令证据。"""
+        self._send_payload(
+            bus,
+            self._config.command_id,
+            encode_pump_command(command),
+        )
+        self.emergency_stop.record_send_success(command)
+
     def _send_payload(self, bus: Any, arbitration_id: int, data: bytes) -> None:
         message = self._message_factory(
             arbitration_id=arbitration_id,
             data=data,
             is_extended_id=False,
         )
-        with self._send_lock:
-            # python-can 的 send(timeout=...) 在发送队列拥塞时有界失败，避免线程持锁
-            # 无限阻塞，导致 stop 无法补发零帧或关闭总线。
-            bus.send(message, timeout=self._config.send_period_s)
+        try:
+            with self._send_lock:
+                # python-can 的 send(timeout=...) 在发送队列拥塞时有界失败，避免线程持锁
+                # 无限阻塞，导致 stop 无法补发零帧或关闭总线。
+                bus.send(message, timeout=self._config.send_period_s)
+        except Exception as exc:
+            self.emergency_stop.record_transport_fault(str(exc))
+            raise
 
     @staticmethod
     def _close_bus(bus: Any) -> None:
