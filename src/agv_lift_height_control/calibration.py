@@ -11,6 +11,7 @@ import os
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from enum import Enum
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
@@ -32,11 +33,23 @@ LIFT_CALIBRATION_PLAN = tuple(
     for repeat in range(1, LIFT_CALIBRATION_REPEATS + 1)
 )
 LOWER_VALVE_LEVELS = tuple(range(0x10, 0xA1, 0x10))
+PREPARE_LOWER_PULSE_S = 0.1
+PREPARE_LOWER_SETTLE_S = 0.7
 CALIBRATION_SCHEMA_VERSION = 1
 
 
 class CalibrationError(ValueError):
     """标定计划、测量值或持久化数据不满足安全约束。"""
+
+
+class PrepareLowerState(str, Enum):
+    """下降标定前预升会话的外部可见状态。"""
+
+    WAIT_AUTH = "待授权"
+    PULSE = "预升脉冲"
+    SETTLE = "停泵观察"
+    DONE = "完成"
+    FAULT = "故障"
 
 
 def _finite_number(name: str, value: object, *, minimum: float | None = None) -> float:
@@ -240,6 +253,159 @@ def _validate_session_inputs(
     ):
         raise CalibrationError("标定下降电流不合理")
     return timestamp, height, feedback
+
+
+class PrepareLowerSession:
+    """用已验证最低PWM短脉冲预升，为下降标定准备传感器行程。
+
+    本类只维护状态并返回期望泵命令。实际CAN发送、5秒NMT安全窗、SSH
+    授权和退出归零仍由前台运行时与 :class:`CanPump` 负责。
+    """
+
+    def __init__(
+        self,
+        lift: LiftCalibrationResult,
+        *,
+        target_mm: float,
+        effective_max_height_mm: float,
+        direction_tolerance_mm: float,
+        sensor_timeout_s: float,
+        feedback_timeout_s: float,
+        current_multiplier: float,
+        current_duration_s: float,
+    ) -> None:
+        if not isinstance(lift, LiftCalibrationResult):
+            raise CalibrationError("预升必须使用有效起升标定草稿")
+        self.target_mm = _finite_number("预升目标高度", target_mm, minimum=0.001)
+        self.effective_max_height_mm = _finite_number(
+            "预升有效最大高度", effective_max_height_mm, minimum=0.001
+        )
+        if self.effective_max_height_mm > 2900.0:
+            raise CalibrationError("预升有效最大高度不得超过2900 mm")
+        if self.target_mm + lift.max_coast_mm > self.effective_max_height_mm:
+            raise CalibrationError("预升目标未给最大停泵上滑保留安全空间")
+        self._pwm = _strict_int("预升PWM", lift.min_stable_pwm, 1, 100)
+        peak = lift.peak_current_by_pwm.get(self._pwm)
+        if type(peak) is not int or peak <= 0:
+            raise CalibrationError("起升草稿缺少最低稳定PWM峰值电流")
+        multiplier = _finite_number("过流倍数", current_multiplier, minimum=1.0)
+        if not 1.0 < multiplier <= 1.5:
+            raise CalibrationError("过流倍数必须大于1且不得超过1.5")
+        self._overcurrent_threshold = peak * multiplier
+        self._current_duration_s = _session_timeout(
+            "过流持续时间", current_duration_s, 0.2
+        )
+        self._direction_tolerance_mm = _finite_number(
+            "direction_tolerance_mm", direction_tolerance_mm, minimum=0
+        )
+        self._sensor_timeout_s = _session_timeout(
+            "sensor_timeout_s", sensor_timeout_s, 0.1
+        )
+        self._feedback_timeout_s = _session_timeout(
+            "feedback_timeout_s", feedback_timeout_s, 0.15
+        )
+        self.state = PrepareLowerState.WAIT_AUTH
+        self.fault_reason: str | None = None
+        self.final_height_mm: float | None = None
+        self._last_now: float | None = None
+        self._initial_height: float | None = None
+        self._cycle_start_height: float | None = None
+        self._pulse_started_at: float | None = None
+        self._settle_started_at: float | None = None
+        self._overcurrent_since: float | None = None
+        self._started_output = False
+
+    @property
+    def done(self) -> bool:
+        return self.state is PrepareLowerState.DONE
+
+    @property
+    def failed(self) -> bool:
+        return self.state is PrepareLowerState.FAULT
+
+    def step(
+        self,
+        *,
+        now: float,
+        sample: HeightSample,
+        feedback: PumpFeedback | None,
+        lift_authorized: bool,
+    ) -> PumpCommand:
+        """推进一次20 ms控制周期；任何失败都锁存并返回完整全零命令。"""
+        if type(lift_authorized) is not bool:
+            raise CalibrationError("lift_authorized 必须是bool")
+        if self.done or self.failed:
+            return PumpCommand.safe_stop()
+        try:
+            timestamp, height, _checked_feedback = _validate_session_inputs(
+                now=now,
+                sample=sample,
+                feedback=feedback,
+                last_now=self._last_now,
+                sensor_timeout_s=self._sensor_timeout_s,
+                feedback_timeout_s=self._feedback_timeout_s,
+                absolute_max_height_mm=self.effective_max_height_mm,
+            )
+            self._last_now = timestamp
+            self.final_height_mm = height
+            if self._initial_height is None:
+                self._initial_height = height
+            if self._started_output and height >= self.target_mm:
+                self.state = PrepareLowerState.DONE
+                return PumpCommand.safe_stop()
+            if self.state is PrepareLowerState.WAIT_AUTH:
+                return self._wait_or_start(timestamp, height, lift_authorized)
+            if self.state is PrepareLowerState.PULSE:
+                return self._advance_pulse(timestamp, lift_authorized)
+            return self._advance_settle(timestamp, height, lift_authorized)
+        except CalibrationError as exc:
+            return self._fail(str(exc))
+
+    def _wait_or_start(
+        self, now: float, height: float, lift_authorized: bool
+    ) -> PumpCommand:
+        if not lift_authorized:
+            return PumpCommand.safe_stop()
+        self.state = PrepareLowerState.PULSE
+        self._pulse_started_at = now
+        self._settle_started_at = None
+        self._cycle_start_height = height
+        self._started_output = True
+        return PumpCommand(interlock=True, lift_pwm=self._pwm)
+
+    def _advance_pulse(self, now: float, lift_authorized: bool) -> PumpCommand:
+        assert self._pulse_started_at is not None
+        if not lift_authorized:
+            # 被中断的短脉冲也必须完成700 ms全零观察，防止按键抖动把多个
+            # 短动作拼成一次长时间通泵。
+            return self._enter_settle(now)
+        if now - self._pulse_started_at + 1e-12 < PREPARE_LOWER_PULSE_S:
+            return PumpCommand(interlock=True, lift_pwm=self._pwm)
+        return self._enter_settle(self._pulse_started_at + PREPARE_LOWER_PULSE_S)
+
+    def _enter_settle(self, started_at: float) -> PumpCommand:
+        self.state = PrepareLowerState.SETTLE
+        self._pulse_started_at = None
+        self._settle_started_at = started_at
+        return PumpCommand.safe_stop()
+
+    def _advance_settle(
+        self, now: float, height: float, lift_authorized: bool
+    ) -> PumpCommand:
+        assert self._settle_started_at is not None
+        if now - self._settle_started_at + 1e-12 < PREPARE_LOWER_SETTLE_S:
+            return PumpCommand.safe_stop()
+        self.state = PrepareLowerState.WAIT_AUTH
+        self._settle_started_at = None
+        self._cycle_start_height = None
+        return self._wait_or_start(now, height, lift_authorized)
+
+    def _fail(self, reason: str) -> PumpCommand:
+        self.state = PrepareLowerState.FAULT
+        self.fault_reason = reason
+        self._pulse_started_at = None
+        self._settle_started_at = None
+        return PumpCommand.safe_stop()
 
 
 class LiftCalibrationSession:

@@ -9,6 +9,8 @@ from agv_lift_height_control import HeightSample, PumpCommand, PumpFeedback
 from agv_lift_height_control.calibration import (
     LIFT_PWM_LEVELS,
     LOWER_VALVE_LEVELS,
+    PREPARE_LOWER_PULSE_S,
+    PREPARE_LOWER_SETTLE_S,
     CalibrationBundle,
     CalibrationError,
     CalibrationStore,
@@ -16,6 +18,8 @@ from agv_lift_height_control.calibration import (
     LiftTrial,
     LowerCalibrationSession,
     LowerTrial,
+    PrepareLowerSession,
+    PrepareLowerState,
     analyze_lift_trials,
     analyze_lower_trials,
 )
@@ -56,6 +60,21 @@ def complete_lower_trials() -> tuple[LowerTrial, ...]:
             success=valve >= 0x30,
         )
         for valve in LOWER_VALVE_LEVELS
+    )
+
+
+def prepare_session(
+    *, target: float = 100.0, upper: float = 200.0
+) -> PrepareLowerSession:
+    return PrepareLowerSession(
+        analyze_lift_trials(complete_lift_trials()),
+        target_mm=target,
+        effective_max_height_mm=upper,
+        direction_tolerance_mm=0.5,
+        sensor_timeout_s=0.1,
+        feedback_timeout_s=0.15,
+        current_multiplier=1.5,
+        current_duration_s=0.2,
     )
 
 
@@ -424,6 +443,108 @@ def test_lower_session_authorization_loss_immediately_stops() -> None:
     assert command.lift_pwm == 0
     assert command.lower_valve == 0
     assert session.trials == ()
+
+
+def test_prepare_lower_uses_40_percent_100ms_pulses_and_700ms_settle() -> None:
+    assert PREPARE_LOWER_PULSE_S == 0.1
+    assert PREPARE_LOWER_SETTLE_S == 0.7
+    session = prepare_session()
+
+    assert session.step(
+        now=0.0,
+        sample=sample(0.0, 10.0),
+        feedback=feedback(0.0),
+        lift_authorized=False,
+    ) == PumpCommand.safe_stop()
+    assert session.state is PrepareLowerState.WAIT_AUTH
+
+    assert session.step(
+        now=0.02,
+        sample=sample(0.02, 10.0),
+        feedback=feedback(0.02),
+        lift_authorized=True,
+    ).lift_pwm == 40
+    assert session.step(
+        now=0.119,
+        sample=sample(0.119, 10.0),
+        feedback=feedback(0.119),
+        lift_authorized=True,
+    ).lift_pwm == 40
+    assert session.step(
+        now=0.12,
+        sample=sample(0.12, 10.0),
+        feedback=feedback(0.12),
+        lift_authorized=True,
+    ) == PumpCommand.safe_stop()
+    assert session.state is PrepareLowerState.SETTLE
+
+    assert session.step(
+        now=0.819,
+        sample=sample(0.819, 14.0),
+        feedback=feedback(0.819),
+        lift_authorized=True,
+    ) == PumpCommand.safe_stop()
+    assert session.step(
+        now=0.82,
+        sample=sample(0.82, 14.0),
+        feedback=feedback(0.82),
+        lift_authorized=True,
+    ).lift_pwm == 40
+
+
+def test_prepare_lower_authorization_loss_stops_and_cannot_bypass_settle() -> None:
+    session = prepare_session()
+    session.step(
+        now=0.0,
+        sample=sample(0.0, 10.0),
+        feedback=feedback(0.0),
+        lift_authorized=True,
+    )
+
+    stopped = session.step(
+        now=0.04,
+        sample=sample(0.04, 10.0),
+        feedback=feedback(0.04),
+        lift_authorized=False,
+    )
+    retried = session.step(
+        now=0.05,
+        sample=sample(0.05, 10.1),
+        feedback=feedback(0.05),
+        lift_authorized=True,
+    )
+
+    assert stopped == PumpCommand.safe_stop()
+    assert retried == PumpCommand.safe_stop()
+    assert session.state is PrepareLowerState.SETTLE
+
+
+def test_prepare_lower_completes_at_target_and_never_commands_lower_valve() -> None:
+    session = prepare_session()
+    first = session.step(
+        now=0.0,
+        sample=sample(0.0, 99.0),
+        feedback=feedback(0.0),
+        lift_authorized=True,
+    )
+
+    command = session.step(
+        now=0.04,
+        sample=sample(0.04, 100.1),
+        feedback=feedback(0.04),
+        lift_authorized=True,
+    )
+
+    assert first.lower_valve == 0
+    assert command == PumpCommand.safe_stop()
+    assert session.done is True
+    assert session.state is PrepareLowerState.DONE
+    assert session.final_height_mm == pytest.approx(100.1)
+
+
+def test_prepare_lower_requires_room_for_measured_coast() -> None:
+    with pytest.raises(CalibrationError, match="上滑.*安全空间"):
+        prepare_session(target=198.0, upper=200.0)
 
 
 def test_lift_session_expired_sample_latches_failure_during_output() -> None:
