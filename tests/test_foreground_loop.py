@@ -5,7 +5,9 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from agv_lift_height_control import (
+    EmergencyStopLatch,
     HeightSample,
+    LiftHeightControl,
     PrepareLowerState,
     PumpCommand,
     PumpFeedback,
@@ -284,7 +286,9 @@ def test_signal_and_controller_fault_are_logged_as_distinct_events() -> None:
 
     clock = Clock()
     logger = Logger()
-    source = MoveCommandSource(FaultController())
+    source = MoveCommandSource(
+        LiftHeightControl(FaultController(), EmergencyStopLatch(clock=clock))
+    )
     ForegroundRuntime(
         mode="move",
         terminal=Terminal([None, TerminalEvent.keypress("q")]),
@@ -358,12 +362,21 @@ def test_move_and_manual_lower_sources_use_controller_step_chain() -> None:
     feedback = PumpFeedback(0.0, 0, 0, 0)
     controller = Controller()
 
-    move = MoveCommandSource(controller).step(0.0, sample, feedback, True, False)
+    move_source = MoveCommandSource(
+        LiftHeightControl(controller, EmergencyStopLatch(clock=lambda: 0.0))
+    )
+    move = move_source.step(0.0, sample, feedback, False, False)
     manual = ManualLowerCommandSource(controller).step(0.02, sample, feedback, False, True)
 
+    assert move_source.allow_lift is move_source.allow_lower is False
+    assert move_source.controller is controller
     assert move.command.lift_pwm == 60
     assert manual.command.lift_pwm == 60
     assert [call[0] for call in controller.calls] == ["step", "step"]
+    assert controller.calls[0][1]["lift_authorized"] is True
+    assert controller.calls[0][1]["lower_authorized"] is True
+    assert controller.calls[1][1]["lift_authorized"] is False
+    assert controller.calls[1][1]["lower_authorized"] is True
 
 
 def test_survey_source_routes_desired_through_step_external() -> None:
@@ -560,6 +573,32 @@ def test_prepare_lower_status_source_populates_target_state_and_fault_snapshot()
     assert value.target_error_mm == 80.0
     assert value.controller_state == "停泵观察"
     assert value.controller_fault == "预升测试故障"
+
+
+def test_snapshot_reads_shared_emergency_stop_without_disguising_it_as_fault() -> None:
+    latch = EmergencyStopLatch(clock=lambda: 1.0)
+    latch.trigger("现场按钮")
+    latch.trigger("后续原因")
+    source = SimpleNamespace(
+        controller=SimpleNamespace(
+            target_mm=None,
+            state=SimpleNamespace(value="emergency_stop"),
+            fault_reason=None,
+        ),
+        emergency_stop_latch=latch,
+    )
+
+    value = runtime()._snapshot(
+        source,
+        HeightSample(1.0, 20, 20.0, True, None),
+        PumpFeedback(1.0, 0, 0, 0),
+        PumpCommand.safe_stop(),
+        PumpCommand.safe_stop(),
+    )
+
+    assert value.emergency_stop_active is True
+    assert value.emergency_stop_reason == "现场按钮"
+    assert value.controller_fault is None
 
 
 def test_exit_event_is_written_after_pump_stop_with_last_actual_command() -> None:

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agv_lift_height_control import HeightSample, PumpCommand
+from agv_lift_height_control import EmergencyStopLatch, HeightSample, PumpCommand
 from agv_lift_height_control.application import (
     ApplicationDependencies,
     _build_control_source,
@@ -100,6 +100,7 @@ class Pump:
 
     def __init__(self):
         self.commands = []
+        self.emergency_stop = None
 
     def update_command(self, command):
         self.commands.append(command)
@@ -146,12 +147,17 @@ def harness(tmp_path, events):
     pump = Pump()
     observer = Observer()
     lock = Lock()
+    def build_pump(_config, emergency_stop):
+        calls.append("pump")
+        pump.emergency_stop = emergency_stop
+        return pump
+
     dependencies = ApplicationDependencies(
         clock=clock,
         sleeper=clock.sleep,
         source_factory=lambda _config: calls.append("source") or object(),
         worker_factory=lambda _source, _period: calls.append("worker") or Worker(),
-        pump_factory=lambda _config: calls.append("pump") or pump,
+        pump_factory=build_pump,
         observer_factory=lambda _config: calls.append("observer") or observer,
         terminal_factory=lambda: Terminal(events),
         logger_factory=lambda _path, _mode: Logger(),
@@ -308,6 +314,7 @@ def test_prepare_lower_builds_from_draft_without_final_bundle(tmp_path) -> None:
         ),
         config,
         store,
+        emergency_stop=EmergencyStopLatch(),
         lift_draft=lift,
     )
 
@@ -332,6 +339,7 @@ def test_prepare_lower_effective_limit_uses_persistent_soft_limit(tmp_path) -> N
         ),
         config,
         store,
+        emergency_stop=EmergencyStopLatch(),
         lift_draft=lift_result(),
     )
 
@@ -452,9 +460,38 @@ def test_calibrate_lift_effective_limit_is_minimum_of_temporary_persistent_and_a
         Namespace(command="calibrate-lift", temporary_max_mm=1000.0),
         config,
         store,
+        emergency_stop=EmergencyStopLatch(),
     )
 
     assert source.session._absolute_max_height_mm == 800.0
+
+
+def test_move_builds_autonomous_source_and_shares_latch_with_pump(
+    tmp_path, monkeypatch
+) -> None:
+    deps, _calls, pump, _observer, _lock = harness(tmp_path, [])
+    state = tmp_path / "state"
+    CalibrationStore(state / "calibration.json").save(final_bundle())
+    observed = {}
+
+    def inspect_run(_runtime, source, *, duration_s=None, max_iterations=None):
+        observed["source"] = source
+        observed["duration_s"] = duration_s
+        assert source.allow_lift is False
+        assert source.allow_lower is False
+        assert source.emergency_stop_latch is pump.emergency_stop
+
+    monkeypatch.setattr(
+        "agv_lift_height_control.application.ForegroundRuntime.run", inspect_run
+    )
+
+    run_application(
+        arguments(tmp_path, "move", target_mm=300.0), dependencies=deps
+    )
+
+    source = observed["source"]
+    assert source.controller.target_mm == 300.0
+    assert observed["duration_s"] == 60.0
 
 
 def test_calibrate_lift_missing_gate_refuses_before_hardware_factories(tmp_path) -> None:

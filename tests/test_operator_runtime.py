@@ -199,6 +199,39 @@ def test_tui_render_shows_actual_and_desired_interlock_state() -> None:
     assert "期望输出: 互锁=关 PWM=0" in rendered
 
 
+def test_tui_move_shows_autonomous_quit_only_and_emergency_stop_reason() -> None:
+    output = io.StringIO()
+    terminal = PosixAnsiTerminal(stdout=output)
+
+    terminal.render(
+        RuntimeSnapshot(
+            mode="move",
+            emergency_stop_active=True,
+            emergency_stop_reason="现场按钮",
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "急停状态: 已锁存" in rendered
+    assert "急停原因: 现场按钮" in rendered
+    assert "自主运动中 | q 安全退出" in rendered
+    assert "u 起升" not in rendered
+    assert "d 下降" not in rendered
+    assert "c 请求清故障" not in rendered
+    assert "e 急停" not in rendered
+
+
+def test_tui_maintenance_mode_keeps_deadman_and_clear_fault_help() -> None:
+    output = io.StringIO()
+    PosixAnsiTerminal(stdout=output).render(RuntimeSnapshot(mode="calibrate-lift"))
+
+    rendered = output.getvalue()
+    assert "u 起升续期700ms" in rendered
+    assert "d 下降续期150ms" in rendered
+    assert "c 请求清故障" in rendered
+    assert "e 急停" not in rendered
+
+
 class TtyFdStream:
     def __init__(self, descriptor: int) -> None:
         self.descriptor = descriptor
@@ -371,6 +404,8 @@ def test_csv_logger_writes_complete_header_cycle_event_and_real_escaping(tmp_pat
         lower_remaining_ms=0,
         controller_fault="故障,详情",
         pump_fault="CAN反馈超时",
+        emergency_stop_active=True,
+        emergency_stop_reason="现场按钮",
     )
     logger.log("cycle", snapshot, detail='a,b"c')
     logger.log("authorization", snapshot, operator_key="u")
@@ -387,7 +422,21 @@ def test_csv_logger_writes_complete_header_cycle_event_and_real_escaping(tmp_pat
     assert rows[0]["desired_lift_pwm"] == "60"
     assert rows[0]["zero_requested"] == "False"
     assert rows[0]["pump_fault"] == "CAN反馈超时"
+    assert rows[0]["emergency_stop_active"] == "True"
+    assert rows[0]["emergency_stop_reason"] == "现场按钮"
     assert [row["event"] for row in rows] == ["cycle", "authorization"]
+
+
+def test_csv_logger_writes_inactive_emergency_stop_as_false_and_empty(tmp_path) -> None:
+    logger = CsvEventLogger(tmp_path, "monitor", clock=lambda: 1.0)
+    logger.log("cycle", RuntimeSnapshot(mode="monitor"))
+    path = logger.path
+    logger.close()
+
+    with path.open(newline="", encoding="utf-8") as stream:
+        row = next(csv.DictReader(stream))
+    assert row["emergency_stop_active"] == "False"
+    assert row["emergency_stop_reason"] == ""
 
 
 def _lift_result() -> LiftCalibrationResult:

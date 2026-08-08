@@ -167,8 +167,14 @@ class PosixAnsiTerminal:
             f"故障码: {_show_fault_code(feedback.fault_code if feedback else None)}",
             f"控制故障: {snapshot.controller_fault or '-'}",
             f"CAN泵状态: {snapshot.pump_fault or '-'}",
+            f"急停状态: {'已锁存' if snapshot.emergency_stop_active else '未锁存'}",
+            f"急停原因: {snapshot.emergency_stop_reason or '-'}",
             f"授权剩余: 起升 {snapshot.lift_remaining_ms} ms / 下降 {snapshot.lower_remaining_ms} ms",
-            "操作: u 起升续期700ms | d 下降续期150ms | c 请求清故障 | q 安全退出",
+            (
+                "操作: 自主运动中 | q 安全退出"
+                if snapshot.mode == "move"
+                else "操作: u 起升续期700ms | d 下降续期150ms | c 请求清故障 | q 安全退出"
+            ),
         )
         # 光标回到左上角后逐行清除旧内容；只在最后使用 ``J`` 无法清掉前面
         # 各行右侧的残留字符，例如故障码从三位缩短成两位时会伪装成三位数。
@@ -430,6 +436,8 @@ class RuntimeSnapshot:
     lower_remaining_ms: int = 0
     controller_fault: str | None = None
     pump_fault: str | None = None
+    emergency_stop_active: bool = False
+    emergency_stop_reason: str | None = None
 
 
 CSV_FIELDS = (
@@ -466,6 +474,8 @@ CSV_FIELDS = (
     "lower_remaining_ms",
     "controller_fault",
     "pump_fault",
+    "emergency_stop_active",
+    "emergency_stop_reason",
     "operator_key",
     "detail",
 )
@@ -543,6 +553,8 @@ class CsvEventLogger:
             "lower_remaining_ms": value.lower_remaining_ms,
             "controller_fault": value.controller_fault,
             "pump_fault": value.pump_fault,
+            "emergency_stop_active": value.emergency_stop_active,
+            "emergency_stop_reason": value.emergency_stop_reason,
             "operator_key": operator_key,
             "detail": detail,
         }

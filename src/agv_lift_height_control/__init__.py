@@ -42,6 +42,7 @@ from .config import (
 )
 from .controller import ControllerState, HeightController
 from .emergency_stop import EmergencyStopLatch, EmergencyStopSnapshot
+from .lift_control import LiftHeightControl
 from .modbus_rtu import ModbusRtuHeightSource
 from .operator_runtime import (
     CsvEventLogger,
@@ -100,6 +101,7 @@ __all__ = [
     "PREPARE_LOWER_SETTLE_S",
     "LiftCalibrationResult",
     "LiftCalibrationSession",
+    "LiftHeightControl",
     "LiftTrial",
     "LowerCalibrationResult",
     "LowerCalibrationDraft",

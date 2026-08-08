@@ -26,6 +26,8 @@ from .calibration import (
 from .can_pump import CanPump
 from .config import AppConfig, load_config
 from .controller import ControllerState, HeightController
+from .emergency_stop import EmergencyStopLatch
+from .lift_control import LiftHeightControl
 from .modbus_rtu import ModbusRtuHeightSource
 from .operator_runtime import (
     EOF_EVENT,
@@ -79,8 +81,35 @@ class ZeroCommandSource:
 
 
 class MoveCommandSource:
-    allow_lift = True
+    """自主定高命令源；键盘授权不参与自动升降决策。"""
+
+    allow_lift = False
     allow_lower = False
+
+    def __init__(self, control: LiftHeightControl) -> None:
+        self.control = control
+
+    @property
+    def controller(self) -> HeightController:
+        return self.control.controller
+
+    @property
+    def emergency_stop_latch(self) -> EmergencyStopLatch:
+        return self.control.emergency_stop_latch
+
+    def step(self, now, sample, feedback, lift_authorized, lower_authorized) -> CommandDecision:
+        if sample is None or feedback is None:
+            return CommandDecision(PumpCommand.safe_stop())
+        # move 是自主模式，u/d 死手状态既不续期也不传入控制层；门面固定使用
+        # 双向自动授权，并继续执行控制器自身的时序、传感器、反馈和限位门禁。
+        return CommandDecision(self.control.update(now, sample, feedback))
+
+
+class ManualLowerCommandSource:
+    """人工下降命令源，保留原有 d 键短时死手授权。"""
+
+    allow_lift = False
+    allow_lower = True
 
     def __init__(self, controller: HeightController) -> None:
         self.controller = controller
@@ -97,11 +126,6 @@ class MoveCommandSource:
                 lower_authorized=lower_authorized,
             )
         )
-
-
-class ManualLowerCommandSource(MoveCommandSource):
-    allow_lift = False
-    allow_lower = True
 
 
 class LiftCalibrationCommandSource:
@@ -675,6 +699,7 @@ class ForegroundRuntime:
         state_text = getattr(state, "value", str(state) if state is not None else None)
         height = sample.height_mm if sample is not None else None
         error = target - height if target is not None and height is not None else None
+        emergency = self._emergency_stop_snapshot(source)
         return RuntimeSnapshot(
             mode=self.mode,
             sample=sample,
@@ -691,7 +716,16 @@ class ForegroundRuntime:
             lower_remaining_ms=self.authorizer.lower_remaining_ms,
             controller_fault=getattr(status, "fault_reason", None),
             pump_fault=getattr(self.pump, "fault_reason", None),
+            emergency_stop_active=bool(getattr(emergency, "active", False)),
+            emergency_stop_reason=getattr(emergency, "reason", None),
         )
+
+    @staticmethod
+    def _emergency_stop_snapshot(source: Any) -> Any | None:
+        """读取命令源共享锁存；普通故障字段不得复用或伪装急停首因。"""
+        latch = getattr(source, "emergency_stop_latch", None)
+        snapshot = getattr(latch, "snapshot", None)
+        return snapshot() if callable(snapshot) else None
 
     def _force_zero(self) -> None:
         if self.pump is not None:
@@ -710,6 +744,7 @@ class ForegroundRuntime:
         zero_requested: bool | None = None,
     ) -> None:
         """事件行分开记录最后实际帧、最新期望命令与归零请求。"""
+        emergency = self._emergency_stop_snapshot(self._command_source)
         self._last_snapshot = replace(
             self._last_snapshot,
             command=self._last_snapshot.command if command is None else command,
@@ -728,6 +763,8 @@ class ForegroundRuntime:
             lift_remaining_ms=self.authorizer.lift_remaining_ms,
             lower_remaining_ms=self.authorizer.lower_remaining_ms,
             pump_fault=getattr(self.pump, "fault_reason", None),
+            emergency_stop_active=bool(getattr(emergency, "active", False)),
+            emergency_stop_reason=getattr(emergency, "reason", None),
         )
 
     def _log_without_masking(self, event: str, **kwargs: object) -> None:
@@ -790,7 +827,7 @@ class ApplicationDependencies:
     sleeper: Callable[[float], None]
     source_factory: Callable[[Any], Any]
     worker_factory: Callable[[Any, float], Any]
-    pump_factory: Callable[[Any], Any]
+    pump_factory: Callable[[Any, EmergencyStopLatch], Any]
     observer_factory: Callable[[Any], Any]
     terminal_factory: Callable[[], Any]
     logger_factory: Callable[[Path, str], Any]
@@ -806,7 +843,9 @@ def default_dependencies() -> ApplicationDependencies:
         sleeper=sleep,
         source_factory=lambda config: ModbusRtuHeightSource(config),
         worker_factory=lambda source, period: SensorWorker(source, poll_period_s=period),
-        pump_factory=lambda config: CanPump(config),
+        pump_factory=lambda config, emergency_stop: CanPump(
+            config, emergency_stop=emergency_stop
+        ),
         observer_factory=lambda config: PassiveCanObserver(config),
         terminal_factory=PosixAnsiTerminal,
         logger_factory=lambda directory, mode: CsvEventLogger(directory, mode),
@@ -929,6 +968,9 @@ def _run_mode(
         if mode in {"calibrate-lower", "prepare-lower"}
         else None
     )
+    # 每次前台会话只创建一个底层急停锁存；move 门面与 CanPump 必须共享同一实例，
+    # 这样任何入口触发后，控制状态和最后 CAN 发送门禁看到的是同一首因与解除证据。
+    emergency_stop = EmergencyStopLatch(clock=deps.clock)
     if mode in {"monitor", "observe-can", "zero-can"}:
         source = ZeroCommandSource()
     else:
@@ -937,6 +979,8 @@ def _run_mode(
             args,
             config,
             calibration_store,
+            emergency_stop=emergency_stop,
+            clock=deps.clock,
             lift_draft=lift_draft,
         )
     terminal = deps.terminal_factory()
@@ -951,10 +995,10 @@ def _run_mode(
     elif mode == "observe-can":
         observer = deps.observer_factory(config.can)
     elif mode == "zero-can":
-        pump = deps.pump_factory(config.can)
+        pump = deps.pump_factory(config.can, emergency_stop)
     else:
         worker = deps.worker_factory(deps.source_factory(config.sensor), config.sensor.poll_period_s)
-        pump = deps.pump_factory(config.can)
+        pump = deps.pump_factory(config.can, emergency_stop)
 
     runtime = ForegroundRuntime(
         mode=mode,
@@ -1031,6 +1075,8 @@ def _build_control_source(
     config: AppConfig,
     calibration_store: CalibrationStore,
     *,
+    emergency_stop: EmergencyStopLatch,
+    clock: Callable[[], float] = monotonic,
     lift_draft=None,
 ):
     if args.command == "calibrate-lift":
@@ -1097,10 +1143,11 @@ def _build_control_source(
         config.control, bundle, feedback_timeout_s=config.can.feedback_timeout_s
     )
     if args.command == "move":
-        controller.set_target(
+        control = LiftHeightControl(controller, emergency_stop, clock=clock)
+        control.set_target_height(
             args.target_mm, temporary_max_height_mm=args.temporary_max_mm
         )
-        return MoveCommandSource(controller)
+        return MoveCommandSource(control)
     if args.command == "manual-lower":
         controller.set_manual_lower(True)
         return ManualLowerCommandSource(controller)
