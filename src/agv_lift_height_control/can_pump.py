@@ -16,7 +16,7 @@ from time import monotonic, sleep
 from typing import Any
 
 from .config import CanConfig
-from .emergency_stop import EmergencyStopLatch
+from .emergency_stop import EmergencyStopLatch, EmergencyStopSnapshot
 from .types import PumpCommand, PumpFeedback
 
 
@@ -444,8 +444,6 @@ class CanPump:
                 # 只能补充诊断，不能覆盖事故首因，也不能让任何非零期望穿透。
                 command = PumpCommand.safe_stop()
                 reason = f"急停锁存: {emergency_snapshot.reason}"
-                with self._state_lock:
-                    self._desired = command
             else:
                 command, reason = select_safe_command(
                     config=self._config,
@@ -456,17 +454,19 @@ class CanPump:
                     feedback=feedback,
                     thread_fault=thread_fault,
                 )
-            with self._state_lock:
-                self._fault_reason = reason
-
             if not nmt_sent:
                 self._send_payload(bus, self._config.nmt_id, encode_nmt_start())
                 with self._state_lock:
                     self._nmt_sent = True
-            self._send_command(bus, command)
+            actual_command, send_snapshot = self._send_command(bus, command)
+            if send_snapshot.active:
+                reason = f"急停锁存: {send_snapshot.reason}"
             with self._state_lock:
-                self._last_sent_command = command
-            return command
+                self._fault_reason = reason
+                self._last_sent_command = actual_command
+                if send_snapshot.active:
+                    self._desired = PumpCommand.safe_stop()
+            return actual_command
 
     def stop(self) -> None:
         """幂等停机：先停止线程，再尽力同步发送零帧，最后关闭总线。"""
@@ -653,14 +653,25 @@ class CanPump:
             # 无法确认线程已结束时必须按仍存活处理，避免清停止事件导致跨代复活。
             return True
 
-    def _send_command(self, bus: Any, command: PumpCommand) -> None:
-        """同步发送 0x217；仅在 ``bus.send`` 成功返回后登记命令证据。"""
-        self._send_payload(
-            bus,
-            self._config.command_id,
-            encode_pump_command(command),
-        )
-        self.emergency_stop.record_send_success(command)
+    def _send_command(
+        self,
+        bus: Any,
+        command: PumpCommand,
+    ) -> tuple[PumpCommand, EmergencyStopSnapshot]:
+        """在急停原子门禁内同步发送，并返回实际命令及最终急停快照。"""
+        with self.emergency_stop.gate_command_for_send(command) as gate:
+            self._send_payload(
+                bus,
+                self._config.command_id,
+                encode_pump_command(gate.command),
+            )
+            if gate.emergency_stop.active:
+                # desired 必须先于全零证据清除；否则 clear 可能在线程切换时先返回，
+                # 使锁存前的旧命令在解除后重新生效。
+                with self._state_lock:
+                    self._desired = PumpCommand.safe_stop()
+            self.emergency_stop.record_send_success(gate.command)
+            return gate.command, gate.emergency_stop
 
     def _send_payload(self, bus: Any, arbitration_id: int, data: bytes) -> None:
         message = self._message_factory(
@@ -674,7 +685,10 @@ class CanPump:
                 # 无限阻塞，导致 stop 无法补发零帧或关闭总线。
                 bus.send(message, timeout=self._config.send_period_s)
         except Exception as exc:
-            self.emergency_stop.record_transport_fault(str(exc))
+            reason = str(exc)
+            if not reason.strip():
+                reason = f"CAN发送失败: {type(exc).__name__}"
+            self.emergency_stop.record_transport_fault(reason)
             raise
 
     @staticmethod

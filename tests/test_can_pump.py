@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from inspect import signature
 from threading import Event, Lock, Thread as WorkerThread, current_thread
@@ -200,6 +201,53 @@ class TimeoutBlockingSendBus(FakeBus):
             self.release_send.wait(1.0 if timeout is None else timeout)
             raise TimeoutError("simulated CAN send timeout")
         super().send(message, timeout=timeout)
+
+
+class GateBlockingSendBus(FakeBus):
+    """只阻塞首个 0x217，同步证明急停触发与正在发送的门禁互斥。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_entered = Event()
+        self.release_send = Event()
+        self._blocked_once = False
+
+    def send(self, message: FakeMessage, timeout: float | None = None) -> None:
+        if message.arbitration_id == 0x217 and not self._blocked_once:
+            self._blocked_once = True
+            self.send_entered.set()
+            self.release_send.wait(1.0)
+        super().send(message, timeout=timeout)
+
+
+class EmptySendError(OSError):
+    pass
+
+
+class EmptyFailureBus(FakeBus):
+    """抛出空文本发送异常，验证故障兜底不会掩盖原异常。"""
+
+    def send(self, message: FakeMessage, timeout: float | None = None) -> None:
+        with self._lock:
+            self.send_timeouts.append(timeout)
+            self.send_attempts.append(message)
+        raise EmptySendError()
+
+
+class PausingGateEmergencyStopLatch(EmergencyStopLatch):
+    """在进入公开原子门禁前暂停，稳定复现早期选择后的急停触发。"""
+
+    def __init__(self, clock) -> None:
+        super().__init__(clock=clock)
+        self.before_gate = Event()
+        self.release_gate = Event()
+
+    @contextmanager
+    def gate_command_for_send(self, command: PumpCommand):
+        self.before_gate.set()
+        self.release_gate.wait(1.0)
+        with super().gate_command_for_send(command) as gate:
+            yield gate
 
 
 class PausingMessageFactory:
@@ -1083,6 +1131,101 @@ def test_active_send_failure_latches_transport_fault_without_automatic_recovery(
         emergency_stop.clear()
 
 
+def test_trigger_waits_for_nonzero_send_gate_then_next_cycle_is_zero() -> None:
+    bus = GateBlockingSendBus()
+    clock = ManualClock(5.0)
+    emergency_stop = EmergencyStopLatch(clock=clock)
+    pump, _, _ = make_pump(bus, clock=clock, emergency_stop=emergency_stop)
+    pump._bus = bus
+    pump._running = True
+    pump._started_at = 0.0
+    pump._nmt_sent = True
+    pump._last_feedback = PumpFeedback(5.0, 1, 0, 2)
+    pump.update_command(PumpCommand(True, 80, 4, 5, 6))
+    cycle_errors: list[BaseException] = []
+
+    def run_cycle() -> None:
+        try:
+            pump.run_cycle(5.0)
+        except BaseException as exc:
+            cycle_errors.append(exc)
+
+    cycle = WorkerThread(target=run_cycle)
+    cycle.start()
+    assert bus.send_entered.wait(0.5)
+
+    trigger_started = Event()
+    trigger_returned = Event()
+
+    def trigger() -> None:
+        trigger_started.set()
+        emergency_stop.trigger("安全回路断开")
+        trigger_returned.set()
+
+    trigger_thread = WorkerThread(target=trigger)
+    trigger_thread.start()
+    assert trigger_started.wait(0.5)
+    trigger_returned_before_send = trigger_returned.wait(0.1)
+
+    bus.release_send.set()
+    cycle.join(timeout=0.5)
+    trigger_thread.join(timeout=0.5)
+
+    assert trigger_returned_before_send is False
+    assert cycle_errors == []
+    assert trigger_returned.is_set()
+    assert bytes(bus.sent[0].data) == bytes([1, 80, 4, 5, 6, 0, 0, 0])
+    assert pump.run_cycle(5.01) == PumpCommand.safe_stop()
+    assert bytes(bus.sent[-1].data) == bytes(8)
+
+
+def test_trigger_between_early_selection_and_send_gate_forces_same_cycle_zero() -> None:
+    bus = FakeBus()
+    clock = ManualClock(5.0)
+    emergency_stop = PausingGateEmergencyStopLatch(clock)
+    pump, _, _ = make_pump(bus, clock=clock, emergency_stop=emergency_stop)
+    pump._bus = bus
+    pump._running = True
+    pump._started_at = 0.0
+    pump._nmt_sent = True
+    pump._last_feedback = PumpFeedback(5.0, 1, 0, 2)
+    pump.update_command(PumpCommand(True, 80, 4, 5, 6))
+    sent_commands: list[PumpCommand] = []
+
+    cycle = WorkerThread(target=lambda: sent_commands.append(pump.run_cycle(5.0)))
+    cycle.start()
+    entered_gate = emergency_stop.before_gate.wait(0.5)
+    if not entered_gate:
+        cycle.join(timeout=0.5)
+        pytest.fail("发送周期未进入最终急停门禁")
+
+    emergency_stop.trigger("最终发送前触发")
+    emergency_stop.release_gate.set()
+    cycle.join(timeout=0.5)
+
+    assert cycle.is_alive() is False
+    assert sent_commands == [PumpCommand.safe_stop()]
+    assert bytes(bus.sent[-1].data) == bytes(8)
+    assert pump.fault_reason == "急停锁存: 最终发送前触发"
+
+
+def test_empty_send_error_keeps_original_exception_and_records_nonblank_fault() -> None:
+    bus = EmptyFailureBus()
+    clock = ManualClock(1.0)
+    emergency_stop = EmergencyStopLatch(clock=clock)
+    pump, _, _ = make_pump(bus, clock=clock, emergency_stop=emergency_stop)
+    pump._bus = bus
+    pump._running = True
+    pump._started_at = 0.0
+    pump._nmt_sent = True
+    emergency_stop.trigger("安全回路断开")
+
+    with pytest.raises(EmptySendError):
+        pump.run_cycle(1.0)
+
+    assert emergency_stop.snapshot().transport_fault == "CAN发送失败: EmptySendError"
+
+
 def test_run_cycle_timestamps_after_atomic_feedback_snapshot() -> None:
     """接收线程在状态锁边界提交反馈时，发送周期不得使用更早的时间。"""
     bus = FakeBus()
@@ -1280,6 +1423,22 @@ def test_stop_zero_frame_is_post_trigger_send_evidence() -> None:
 
     assert emergency_stop.snapshot().active is False
     assert all(bytes(frame.data) == bytes(8) for frame in bus.sent)
+
+
+def test_stop_zero_evidence_clears_desired_before_latch_can_clear() -> None:
+    bus = FakeBus()
+    clock = ManualClock(1.0)
+    emergency_stop = EmergencyStopLatch(clock=clock)
+    pump, _, _ = make_pump(bus, clock=clock, emergency_stop=emergency_stop)
+    pump._bus = bus
+    pump._running = True
+    pump.update_command(PumpCommand(True, 80, 4, 5, 6))
+    emergency_stop.trigger("操作员急停")
+
+    pump.stop()
+    emergency_stop.clear()
+
+    assert pump.desired_command == PumpCommand.safe_stop()
 
 
 def test_stop_zero_frame_failure_latches_transport_fault() -> None:

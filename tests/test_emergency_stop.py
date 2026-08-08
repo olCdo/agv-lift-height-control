@@ -157,6 +157,16 @@ def test_nonzero_send_after_zero_send_revokes_clear_evidence() -> None:
         latch.clear()
 
 
+def test_send_gate_returns_zero_and_trigger_snapshot_while_latched() -> None:
+    latch = EmergencyStopLatch()
+    latch.trigger("安全回路断开")
+
+    with latch.gate_command_for_send(PumpCommand(lift_pwm=80)) as gate:
+        assert gate.command == PumpCommand.safe_stop()
+        assert gate.emergency_stop.active is True
+        assert gate.emergency_stop.reason == "安全回路断开"
+
+
 def test_transport_fault_must_be_explicitly_recovered_before_clear() -> None:
     latch = EmergencyStopLatch()
     latch.trigger("sensor timeout")

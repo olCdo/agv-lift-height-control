@@ -1,6 +1,7 @@
 """线程安全的锁存急停门禁。"""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from math import isfinite
 from numbers import Real
@@ -38,6 +39,14 @@ class EmergencyStopSnapshot:
     transport_fault: str | None
 
 
+@dataclass(frozen=True)
+class EmergencyStopSendGate:
+    """一次原子发送门禁最终选出的命令及其急停状态。"""
+
+    command: PumpCommand
+    emergency_stop: EmergencyStopSnapshot
+
+
 class EmergencyStopLatch:
     """锁存首次急停，并用全零发送证据和传输状态约束解除操作。"""
 
@@ -60,6 +69,27 @@ class EmergencyStopLatch:
                 zero_sent_after_trigger=self._zero_sent_after_trigger,
                 transport_fault=self._transport_fault,
             )
+
+    @contextmanager
+    def gate_command_for_send(
+        self,
+        command: PumpCommand,
+    ) -> Iterator[EmergencyStopSendGate]:
+        """最终选择命令并阻止急停在同步发送完成前插入。"""
+        if not isinstance(command, PumpCommand):
+            raise TypeError("command 必须是 PumpCommand")
+        with self._lock:
+            snapshot = EmergencyStopSnapshot(
+                active=self._active,
+                reason=self._reason,
+                triggered_at=self._triggered_at,
+                zero_sent_after_trigger=self._zero_sent_after_trigger,
+                transport_fault=self._transport_fault,
+            )
+            # 最终选择与 trigger 共用同一把锁；调用方持有该上下文跨越同步发送，
+            # 因而 trigger 返回后不可能再出现本次门禁放行的非零帧。
+            actual_command = PumpCommand.safe_stop() if snapshot.active else command
+            yield EmergencyStopSendGate(actual_command, snapshot)
 
     def trigger(self, reason: str) -> None:
         """锁存第一次急停原因和时间；后续触发不得覆盖事故首因。"""
