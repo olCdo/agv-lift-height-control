@@ -240,7 +240,7 @@ def test_clear_requires_both_cached_sample_and_feedback() -> None:
     assert controller.state is ControllerState.EMERGENCY_STOP
 
 
-def test_clear_cannot_bypass_a_controller_fault_hidden_by_emergency_stop() -> None:
+def test_clear_emergency_stop_restores_fault_until_explicit_fault_clear() -> None:
     now = [1.0]
     control, controller, latch = _control(now)
     control.set_target_height(300.0)
@@ -250,11 +250,23 @@ def test_clear_cannot_bypass_a_controller_fault_hidden_by_emergency_stop() -> No
     control.update(1.0, _sample(1.0), _feedback(1.0))
     latch.record_send_success(PumpCommand.safe_stop())
 
-    with pytest.raises(RuntimeError, match="普通故障"):
-        control.clear_emergency_stop()
+    control.clear_emergency_stop()
 
-    assert latch.snapshot().active is True
-    assert controller.state is ControllerState.EMERGENCY_STOP
+    assert latch.snapshot().active is False
+    assert controller.state is ControllerState.FAULT
+    assert controller.target_mm is None
+    assert control.update(1.0, _sample(1.0), _feedback(1.0)) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.FAULT
+
+    # 急停撤销了旧目标；普通故障未显式清除前，即使设置新目标也只能保持全零。
+    control.set_target_height(300.0)
+    assert control.update(1.05, _sample(1.05), _feedback(1.05)) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.FAULT
+
+    controller.clear_fault()
+    recovered = control.update(1.1, _sample(1.1), _feedback(1.1))
+    assert recovered.lift_pwm > 0
+    assert controller.state is ControllerState.COARSE_LIFT
 
 
 def test_clear_requires_zero_send_evidence_and_a_recovered_transport() -> None:

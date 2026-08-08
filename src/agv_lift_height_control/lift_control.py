@@ -125,8 +125,6 @@ class LiftHeightControl:
                 raise RuntimeError(
                     f"CAN 泵反馈故障码 {feedback.fault_code} 未清零，禁止解除急停"
                 )
-            if self.controller.fault_reason is not None:
-                raise RuntimeError("控制器已有普通故障，禁止通过急停解除绕过")
 
             # latch.clear 还会原子核验本次急停后的全零成功发送证据及传输恢复状态。
             # guard 与 trigger、发送门禁共用底层锁，使“锁存解除 + 控制器退出”成为
