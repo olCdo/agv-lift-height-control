@@ -169,6 +169,39 @@ def test_terminal_pulse_settles_before_first_on_and_waits_after_each_pulse() -> 
     assert step(controller, 1.40, 100.0).lift_pwm == 50
 
 
+@pytest.mark.parametrize(
+    ("height_mm", "expected_on_s"),
+    [
+        (72.94921875, 0.1),
+        (77.83203125, 0.05),
+    ],
+)
+def test_terminal_pulse_halves_action_inside_measured_coast_distance(
+    height_mm: float, expected_on_s: float
+) -> None:
+    field_calibration = CalibrationBundle(
+        min_stable_pwm=40,
+        coarse_pwm=40,
+        response_delay_s=0.184041741999863,
+        max_coast_mm=4.296875,
+        peak_current_by_pwm={40: 1112},
+        lower_min_start_valve=0x50,
+        lower_comfortable_valve=0x50,
+        soft_upper_limit_mm=None,
+    )
+    controller = HeightController(control_config(), field_calibration)
+    controller.set_target(80.0, temporary_max_height_mm=200.0)
+
+    assert step(controller, 0.0, height_mm) == PumpCommand.safe_stop()
+    for now in (0.08, 0.16, 0.24, 0.32, 0.40, 0.48, 0.56, 0.64):
+        assert step(controller, now, height_mm) == PumpCommand.safe_stop()
+
+    started_at = controller.pulse_wait_s
+    assert step(controller, started_at, height_mm).lift_pwm == 40
+    assert step(controller, started_at + expected_on_s - 0.001, height_mm).lift_pwm == 40
+    assert step(controller, started_at + expected_on_s, height_mm) == PumpCommand.safe_stop()
+
+
 def test_terminal_authorization_loss_restarts_with_full_settle() -> None:
     controller = HeightController(control_config(), calibration())
     controller.set_target(110.0)

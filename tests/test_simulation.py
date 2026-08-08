@@ -67,6 +67,34 @@ def test_simulator_models_dead_zone_response_delay_and_decaying_coast() -> None:
     assert 0 < third_stop.height_mm - second_stop.height_mm < second_stop.height_mm - first_stop.height_mm
 
 
+def test_simulator_preserves_delayed_lift_after_command_returns_zero() -> None:
+    simulator = HydraulicLiftSimulator(
+        initial_height_mm=100,
+        min_lift_pwm=45,
+        response_delay_s=0.15,
+        max_lift_speed_mm_s=300,
+        coast_decay_s=0.1,
+        fixed_step_s=0.05,
+    )
+    lift = PumpCommand(interlock=True, lift_pwm=70)
+
+    simulator.advance(lift)
+    powered_end = simulator.advance(lift)
+    assert powered_end.height_mm == 100
+
+    first_zero = simulator.advance(PumpCommand.safe_stop())
+    delayed_first = simulator.advance(PumpCommand.safe_stop())
+    delayed_second = simulator.advance(PumpCommand.safe_stop())
+    coast = simulator.advance(PumpCommand.safe_stop())
+
+    assert first_zero.height_mm == powered_end.height_mm
+    assert delayed_first.height_mm > first_zero.height_mm
+    assert delayed_second.height_mm > delayed_first.height_mm
+    assert 0 < coast.height_mm - delayed_second.height_mm < (
+        delayed_second.height_mm - delayed_first.height_mm
+    )
+
+
 def test_simulator_rejects_simultaneous_lift_and_lower() -> None:
     simulator = HydraulicLiftSimulator()
 

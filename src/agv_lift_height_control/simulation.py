@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import exp, isfinite
@@ -18,6 +19,15 @@ class HydraulicSnapshot:
     velocity_mm_s: float
     sample: HeightSample
     feedback: PumpFeedback
+
+
+@dataclass(frozen=True)
+class _VelocitySegment:
+    """一段待响应延迟后执行的目标速度历史。"""
+
+    start_s: float
+    end_s: float
+    target_velocity_mm_s: float | None
 
 
 def _number(name: str, value: object, *, minimum: float, strict: bool = False) -> float:
@@ -75,8 +85,7 @@ class HydraulicLiftSimulator:
         self._clock = clock
         self._now = _number("clock", clock() if clock is not None else 0.0, minimum=0)
         self._velocity_mm_s = 0.0
-        self._lift_elapsed_s = 0.0
-        self._lower_elapsed_s = 0.0
+        self._velocity_history: deque[_VelocitySegment] = deque()
         self._current_raw = 0
 
     @property
@@ -108,28 +117,22 @@ class HydraulicLiftSimulator:
             raise ValueError("仿真拒绝同时起升和下降")
         duration, next_now = self._resolve_step(dt_s)
 
+        target_velocity = self._command_target_velocity(command)
+        self._velocity_history.append(
+            _VelocitySegment(self._now, next_now, target_velocity)
+        )
+        # 响应延迟是命令到机械动作的时间平移，不会因当前帧已经归零而删除
+        # 之前的液压脉冲；这与现场“100 ms停泵后才开始位移”的日志一致。
+        self._integrate_delayed_history(
+            self._now - self.response_delay_s,
+            next_now - self.response_delay_s,
+        )
+
         if command.interlock and command.lift_pwm > self.min_lift_pwm:
-            self._lower_elapsed_s = 0.0
-            target_velocity = self.max_lift_speed_mm_s * (
-                (command.lift_pwm - self.min_lift_pwm) / (100 - self.min_lift_pwm)
-            )
-            moving_duration = self._moving_duration(self._lift_elapsed_s, duration)
-            self._lift_elapsed_s += duration
-            self._integrate_delayed_target(duration, moving_duration, target_velocity)
             self._current_raw = command.lift_pwm * 10
         elif command.interlock and command.lower_valve > 0:
-            self._lift_elapsed_s = 0.0
-            target_velocity = -self.max_lower_speed_mm_s * (
-                command.lower_valve / 255.0
-            )
-            moving_duration = self._moving_duration(self._lower_elapsed_s, duration)
-            self._lower_elapsed_s += duration
-            self._integrate_delayed_target(duration, moving_duration, target_velocity)
             self._current_raw = 0
         else:
-            self._lift_elapsed_s = 0.0
-            self._lower_elapsed_s = 0.0
-            self._integrate_coast(duration)
             self._current_raw = 0
 
         self.height_mm = max(0.0, self.height_mm)
@@ -149,21 +152,46 @@ class HydraulicLiftSimulator:
             raise ValueError("注入时钟必须单调前进")
         return duration, next_now
 
-    def _moving_duration(self, previous_elapsed: float, duration: float) -> float:
-        new_elapsed = previous_elapsed + duration
-        return max(0.0, new_elapsed - self.response_delay_s) - max(
-            0.0, previous_elapsed - self.response_delay_s
-        )
+    def _command_target_velocity(self, command: PumpCommand) -> float | None:
+        if command.interlock and command.lift_pwm > self.min_lift_pwm:
+            return self.max_lift_speed_mm_s * (
+                (command.lift_pwm - self.min_lift_pwm) / (100 - self.min_lift_pwm)
+            )
+        if command.interlock and command.lower_valve > 0:
+            return -self.max_lower_speed_mm_s * (command.lower_valve / 255.0)
+        return None
 
-    def _integrate_delayed_target(
-        self, duration: float, moving_duration: float, target_velocity: float
-    ) -> None:
-        delayed_duration = max(0.0, duration - moving_duration)
-        if delayed_duration:
-            self._integrate_coast(delayed_duration)
-        if moving_duration:
-            self._velocity_mm_s = target_velocity
-            self.height_mm += target_velocity * moving_duration
+    def _integrate_delayed_history(self, source_start: float, source_end: float) -> None:
+        """积分延迟前的命令区间；无命令的间隙继续按当前速度指数滑行。"""
+        cursor = source_start
+        for segment in self._velocity_history:
+            if segment.end_s <= cursor:
+                continue
+            if segment.start_s >= source_end:
+                break
+            if cursor < segment.start_s:
+                gap_end = min(segment.start_s, source_end)
+                self._integrate_coast(gap_end - cursor)
+                cursor = gap_end
+            overlap_start = max(cursor, segment.start_s)
+            overlap_end = min(source_end, segment.end_s)
+            if overlap_end <= overlap_start:
+                continue
+            segment_duration = overlap_end - overlap_start
+            if segment.target_velocity_mm_s is None:
+                self._integrate_coast(segment_duration)
+            else:
+                self._velocity_mm_s = segment.target_velocity_mm_s
+                self.height_mm += self._velocity_mm_s * segment_duration
+            cursor = overlap_end
+        if cursor < source_end:
+            self._integrate_coast(source_end - cursor)
+
+        while (
+            self._velocity_history
+            and self._velocity_history[0].end_s <= source_start
+        ):
+            self._velocity_history.popleft()
 
     def _integrate_coast(self, duration: float) -> None:
         if duration <= 0 or self._velocity_mm_s == 0:

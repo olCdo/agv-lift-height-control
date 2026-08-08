@@ -85,6 +85,9 @@ class HeightController:
         # 响应延迟只决定停泵后需观察多久，不能当作通泵时长；否则延迟越大，
         # 实际注入的液压能量反而越多。末端动作必须复用已现场验证的100 ms标定脉冲。
         self.pulse_on_s = LIFT_PULSE_S
+        # 当剩余误差已经小于实测最大滑行量时，完整100 ms会把约半个滑行量
+        # 的误差直接推过目标；50 ms微脉冲保留同一40%实测档，只减小单次能量。
+        self.fine_pulse_on_s = LIFT_PULSE_S / 2.0
         self.pulse_wait_s = min(
             max(calibration.response_delay_s + config.stable_time_s, 0.3), 1.0
         )
@@ -102,6 +105,7 @@ class HeightController:
         self._stable_since: float | None = None
         self._terminal_pulse_phase: _TerminalPulsePhase | None = None
         self._pulse_phase_started: float | None = None
+        self._active_pulse_on_s: float | None = None
         self._last_step_at: float | None = None
         self._last_sample: HeightSample | None = None
         self._last_command = PumpCommand.safe_stop()
@@ -732,20 +736,31 @@ class HeightController:
                 # 完整观察后才允许按实时误差重新回到P控制或粗升。
                 self._reset_terminal_pulse()
                 return self._automatic_command(now, height_mm)
+            error_mm = self._target_mm - height_mm
+            self._active_pulse_on_s = self._terminal_pulse_on_s(error_mm)
             self._terminal_pulse_phase = _TerminalPulsePhase.ON
             self._pulse_phase_started = now
             return self._lift_command(self.calibration.min_stable_pwm, height_mm)
 
-        if elapsed + 1e-12 < self.pulse_on_s:
+        assert self._active_pulse_on_s is not None
+        if elapsed + 1e-12 < self._active_pulse_on_s:
             return self._lift_command(self.calibration.min_stable_pwm, height_mm)
         self._terminal_pulse_phase = _TerminalPulsePhase.WAIT
         self._pulse_phase_started = now
+        self._active_pulse_on_s = None
         return PumpCommand.safe_stop()
+
+    def _terminal_pulse_on_s(self, error_mm: float) -> float:
+        """按当前剩余误差选择本次通泵秒数；一次ON相位内不再动态改档。"""
+        if 0 < error_mm <= self.calibration.max_coast_mm:
+            return self.fine_pulse_on_s
+        return self.pulse_on_s
 
     def _reset_terminal_pulse(self) -> None:
         """清除末端内部相位，保证下一次进入必定先执行停泵观察。"""
         self._terminal_pulse_phase = None
         self._pulse_phase_started = None
+        self._active_pulse_on_s = None
 
     def _lift_command(self, pwm: int, height_mm: float) -> PumpCommand:
         limit_reason = self._lift_upper_limit_reason(height_mm)
