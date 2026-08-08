@@ -268,23 +268,165 @@ def test_hydraulic_hold_fails_to_all_zero_on_sensor_fault() -> None:
     assert controller.state is ControllerState.FAULT
 
 
-def test_overshoot_never_auto_lowers_and_faults_only_beyond_limit() -> None:
+def test_target_below_current_height_commands_confirmed_lower_valve() -> None:
     controller = HeightController(control_config(), calibration())
     controller.set_target(100.0)
 
-    command = step(controller, 0.0, 103.0)
+    command = step(
+        controller,
+        0.0,
+        130.0,
+        lift_authorized=False,
+        lower_authorized=False,
+    )
+
+    assert controller.state is ControllerState.COARSE_LOWER
+    assert command == PumpCommand(interlock=True, lower_valve=0x50)
+
+
+def test_lower_terminal_zone_obeys_exact_settle_and_pulse_boundaries() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(100.0)
+
+    assert step(controller, 0.0, 108.0) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.LOWER_SETTLE
+    for now in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6):
+        assert step(controller, now, 108.0) == PumpCommand.safe_stop()
+    assert step(controller, 0.69, 108.0) == PumpCommand.safe_stop()
+    assert step(controller, 0.70, 108.0) == PumpCommand(
+        interlock=True,
+        lower_valve=0x50,
+    )
+    assert controller.state is ControllerState.LOWER_PULSE
+    assert step(controller, 0.749, 108.0).lower_valve == 0x50
+    assert step(controller, 0.75, 107.0) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.LOWER_SETTLE
+    for now in (0.85, 0.95, 1.05, 1.15, 1.25, 1.35):
+        assert step(controller, now, 107.0) == PumpCommand.safe_stop()
+    assert step(controller, 1.44, 107.0) == PumpCommand.safe_stop()
+    assert step(controller, 1.45, 107.0).lower_valve == 0x50
+    assert controller.state is ControllerState.LOWER_PULSE
+
+
+def test_automatic_command_never_combines_lift_and_lower_outputs() -> None:
+    cases = (
+        (200.0, 100.0),
+        (100.0, 200.0),
+        (100.0, 108.0),
+        (100.0, 101.0),
+    )
+    for target, height in cases:
+        controller = HeightController(control_config(), calibration())
+        controller.set_target(target)
+
+        command = step(controller, 0.0, height)
+
+        assert not (command.lift_pwm and command.lower_valve)
+
+
+def test_lift_overshoot_stops_without_auto_lower_and_faults_beyond_limit() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(100.0)
+    assert step(controller, 0.0, 80.0).lift_pwm > 0
+
+    command = step(controller, 0.05, 103.0)
     assert command.lift_pwm == command.lower_valve == 0
     assert command.interlock is False
     assert controller.state is ControllerState.IDLE
     assert controller.trial_failed
     assert controller.fault_reason is None
+    assert step(controller, 0.10, 103.0) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.IDLE
 
     controller = HeightController(control_config(), calibration())
     controller.set_target(100.0)
-    command = step(controller, 0.0, 106.0)
+    assert step(controller, 0.0, 80.0).lift_pwm > 0
+    command = step(controller, 0.05, 106.0)
     assert command.lift_pwm == command.lower_valve == 0
     assert controller.state is ControllerState.FAULT
+    assert controller.fault_kind == "overshoot"
     assert "超调" in (controller.fault_reason or "")
+
+
+def test_lower_undershoot_stops_without_auto_lift_and_faults_beyond_limit() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(100.0)
+    assert step(controller, 0.0, 120.0).lower_valve == 0x50
+
+    command = step(controller, 0.05, 97.9)
+    assert command == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.IDLE
+    assert controller.trial_failed is True
+    assert controller.fault_reason is None
+    assert step(controller, 0.10, 97.9) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.IDLE
+
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(100.0)
+    assert step(controller, 0.0, 120.0).lower_valve == 0x50
+
+    command = step(controller, 0.05, 94.9)
+    assert command == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.FAULT
+    assert controller.fault_kind == "undershoot"
+    assert "下冲" in (controller.fault_reason or "")
+
+
+def test_hold_clears_lower_approach_before_three_mm_downward_drift() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(100.0)
+    assert step(controller, 0.0, 108.0) == PumpCommand.safe_stop()
+
+    for now in (0.05, 0.15, 0.25, 0.35, 0.45, 0.55):
+        assert step(controller, now, 101.0) == PumpCommand.hydraulic_hold()
+    assert controller.state is ControllerState.HOLD
+    assert controller._approach_direction is None
+    assert controller._lower_phase is None
+    assert controller._lower_phase_started is None
+
+    assert step(controller, 0.60, 103.0) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.LOWER_SETTLE
+    for now in (0.70, 0.80, 0.90, 1.00, 1.10, 1.20):
+        assert step(controller, now, 103.0) == PumpCommand.safe_stop()
+    assert step(controller, 1.29, 103.0) == PumpCommand.safe_stop()
+    assert step(controller, 1.30, 103.0).lower_valve == 0x50
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["new_target", "cancel", "fault", "manual_lower", "external", "emergency"],
+)
+def test_all_intent_and_safety_paths_reset_lower_internal_phase(action: str) -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(100.0)
+    assert step(controller, 0.0, 108.0) == PumpCommand.safe_stop()
+    assert controller._lower_phase is not None
+    assert controller._lower_phase_started == pytest.approx(0.0)
+    assert controller._approach_direction == "lower"
+
+    if action == "new_target":
+        controller.set_target(90.0)
+    elif action == "cancel":
+        controller.cancel()
+    elif action == "fault":
+        controller.step(
+            now=0.05,
+            sample=sample(0.05, 108.0, valid=False),
+            feedback=feedback(0.05),
+            lift_authorized=True,
+            lower_authorized=False,
+        )
+    elif action == "manual_lower":
+        controller.set_manual_lower(True)
+    elif action == "external":
+        controller.enter_external_mode(ControllerState.SURVEY)
+    else:
+        controller.enter_emergency_stop("测试下降相位复位")
+        controller.exit_emergency_stop()
+
+    assert controller._lower_phase is None
+    assert controller._lower_phase_started is None
+    assert controller._approach_direction is None
 
 
 def test_lift_authorization_loss_is_immediate_zero_without_reverse_output() -> None:

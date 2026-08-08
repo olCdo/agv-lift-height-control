@@ -2,8 +2,8 @@
 
 ``step`` 与 ``step_external`` 都先执行急停门禁；急停状态在任何输入或时序校验前
 严格全零返回。非急停时的安全顺序为：输入与时序门禁 → 锁存故障处理 → 控制状态机
-→ 授权门控。任何门禁失败都返回完整全零；运动授权缺失时禁止非零动作，但无故障的
-目标稳定窗口允许只启用互锁的液压保持。本控制器永不因自动目标而下降。
+→ 起升授权门控。任何门禁失败都返回完整全零；自动起升撤权时禁止非零动作，人工及
+外部下降也保留授权门控，自动下降则直接由目标误差控制。目标稳定窗口只启用液压互锁。
 """
 
 from __future__ import annotations
@@ -29,6 +29,9 @@ class ControllerState(str, Enum):
     COARSE_LIFT = "coarse_lift"
     P_CONTROL = "p_control"
     TERMINAL_PULSE = "terminal_pulse"
+    COARSE_LOWER = "coarse_lower"
+    LOWER_SETTLE = "lower_settle"
+    LOWER_PULSE = "lower_pulse"
     HOLD = "hold"
     MANUAL_LOWER = "manual_lower"
     SURVEY = "survey"
@@ -40,6 +43,11 @@ class _TerminalPulsePhase(str, Enum):
     SETTLE = "settle"
     ON = "on"
     WAIT = "wait"
+
+
+class _LowerPulsePhase(str, Enum):
+    SETTLE = "settle"
+    ON = "on"
 
 
 EXTERNAL_CONTROLLER_STATES = frozenset(
@@ -110,6 +118,9 @@ class HeightController:
         self._terminal_pulse_phase: _TerminalPulsePhase | None = None
         self._pulse_phase_started: float | None = None
         self._active_pulse_on_s: float | None = None
+        self._lower_phase: _LowerPulsePhase | None = None
+        self._lower_phase_started: float | None = None
+        self._approach_direction: str | None = None
         self._last_step_at: float | None = None
         self._last_sample: HeightSample | None = None
         self._last_command = PumpCommand.safe_stop()
@@ -136,7 +147,7 @@ class HeightController:
         *,
         temporary_max_height_mm: float | None = None,
     ) -> None:
-        """设置自动起升目标；无持久软限位时强制提供人工临时上限。"""
+        """设置自动高度目标；无持久软限位时强制提供人工临时上限。"""
         if self.state is ControllerState.EMERGENCY_STOP:
             raise RuntimeError("急停状态中禁止设置自动目标")
         if self._external_mode is not None:
@@ -161,6 +172,8 @@ class HeightController:
         self._manual_lower = False
         self._stable_since = None
         self._reset_terminal_pulse()
+        self._reset_lower_pulse()
+        self._approach_direction = None
         self.trial_failed = False
         if self.state is not ControllerState.FAULT:
             self.state = ControllerState.IDLE
@@ -171,6 +184,8 @@ class HeightController:
         self._manual_lower = False
         self._stable_since = None
         self._reset_terminal_pulse()
+        self._reset_lower_pulse()
+        self._approach_direction = None
         self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
         self._record_actual_command(PumpCommand.safe_stop())
         if (
@@ -189,10 +204,12 @@ class HeightController:
         if self._external_mode is not None:
             raise RuntimeError("外部模式中禁止设置人工下降")
         self._manual_lower = active
+        self._reset_terminal_pulse()
+        self._reset_lower_pulse()
+        self._approach_direction = None
         if active:
             self._target_mm = None
             self._stable_since = None
-            self._reset_terminal_pulse()
             self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
             self._record_actual_command(PumpCommand.safe_stop())
         if self.state is not ControllerState.FAULT:
@@ -229,6 +246,8 @@ class HeightController:
         self._external_mode = None
         self._stable_since = None
         self._reset_terminal_pulse()
+        self._reset_lower_pulse()
+        self._approach_direction = None
         self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
         self._fault_clear_requested = False
         self._record_actual_command(PumpCommand.safe_stop())
@@ -245,6 +264,8 @@ class HeightController:
         self._manual_lower = False
         self._stable_since = None
         self._reset_terminal_pulse()
+        self._reset_lower_pulse()
+        self._approach_direction = None
         self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
         self._fault_clear_requested = False
         # 急停期间不执行周期校验；解除后必须从首个新周期重新建立时序基线。
@@ -265,6 +286,8 @@ class HeightController:
         self._manual_lower = False
         self._stable_since = None
         self._reset_terminal_pulse()
+        self._reset_lower_pulse()
+        self._approach_direction = None
         self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
         # 命令源所有权在此原子切换；旧自动命令的方向/过流历史不能污染
         # 外部标定或 Survey 状态，否则 controller.step 会把安全模式误锁故障。
@@ -281,6 +304,9 @@ class HeightController:
         """退出外部命令源模式；故障状态下调用不会绕过故障锁存。"""
         if self._external_mode is not None:
             self._external_mode = None
+            self._reset_terminal_pulse()
+            self._reset_lower_pulse()
+            self._approach_direction = None
             self._record_actual_command(PumpCommand.safe_stop())
             if self.state is not ControllerState.FAULT:
                 self.state = ControllerState.MONITOR
@@ -717,32 +743,79 @@ class HeightController:
         return None
 
     def _automatic_command(self, now: float, height_mm: float) -> PumpCommand:
+        """按误差和本轮接近方向分派保持、起升、下降或越界停机。"""
         assert self._target_mm is not None
         error = self._target_mm - height_mm
-        overshoot = -error
-        if overshoot > self.config.overshoot_limit_mm:
+        if abs(error) <= self.config.tolerance_mm:
+            return self._hold_command(now)
+        if self._approach_direction == "lower" and error > self.config.tolerance_mm:
+            return self._lower_undershoot(now, height_mm, error)
+        if self._approach_direction == "lift" and error < -self.config.tolerance_mm:
+            return self._lift_overshoot(now, height_mm, -error)
+        if error > 0:
+            self._approach_direction = "lift"
+            self._reset_lower_pulse()
+            return self._automatic_lift_command(now, height_mm, error)
+
+        self._approach_direction = "lower"
+        self._reset_terminal_pulse()
+        return self._automatic_lower_command(now, height_mm, -error)
+
+    def _hold_command(self, now: float) -> PumpCommand:
+        """保持容差带并在连续稳定后允许下一轮重新选择接近方向。"""
+        self._reset_terminal_pulse()
+        self._reset_lower_pulse()
+        if self._stable_since is None:
+            self._stable_since = now
+        if now - self._stable_since + 1e-12 >= self.config.stable_time_s:
+            self.state = ControllerState.HOLD
+            self._approach_direction = None
+        else:
+            self.state = ControllerState.IDLE
+        return PumpCommand.hydraulic_hold()
+
+    def _lower_undershoot(
+        self, now: float, height_mm: float, undershoot_mm: float
+    ) -> PumpCommand:
+        """停止本轮下降下冲；未稳定到 HOLD 前禁止自动反向起升。"""
+        if undershoot_mm > self.config.overshoot_limit_mm:
             return self._fault(
-                f"目标超调 {overshoot:.3f} mm，超过安全上限",
+                f"目标下冲 {undershoot_mm:.3f} mm，超过安全上限",
+                kind="undershoot",
+                height_mm=height_mm,
+                timestamp=now,
+            )
+        # 下降越过目标说明本轮液压响应尚未受控。立即反向起升会形成来回振荡，
+        # 因此保留lower接近方向并全零，直到新目标或明确安全恢复路径重置意图。
+        self.state = ControllerState.IDLE
+        self.trial_failed = True
+        self._stable_since = None
+        self._reset_lower_pulse()
+        return PumpCommand.safe_stop()
+
+    def _lift_overshoot(
+        self, now: float, height_mm: float, overshoot_mm: float
+    ) -> PumpCommand:
+        """停止本轮起升超调；未稳定到 HOLD 前禁止自动反向下降。"""
+        if overshoot_mm > self.config.overshoot_limit_mm:
+            return self._fault(
+                f"目标超调 {overshoot_mm:.3f} mm，超过安全上限",
                 kind="overshoot",
                 height_mm=height_mm,
                 timestamp=now,
             )
-        if error < -self.config.tolerance_mm:
-            self.state = ControllerState.IDLE
-            self.trial_failed = True
-            self._stable_since = None
-            self._reset_terminal_pulse()
-            return PumpCommand.safe_stop()
-        if abs(error) <= self.config.tolerance_mm:
-            self._reset_terminal_pulse()
-            if self._stable_since is None:
-                self._stable_since = now
-            if now - self._stable_since + 1e-12 >= self.config.stable_time_s:
-                self.state = ControllerState.HOLD
-            else:
-                self.state = ControllerState.IDLE
-            return PumpCommand.hydraulic_hold()
+        # 与下降下冲对称：保留lift接近方向，让后续周期继续保持全零，
+        # 不能用自动下降掩盖当前起升控制已经失败的事实。
+        self.state = ControllerState.IDLE
+        self.trial_failed = True
+        self._stable_since = None
+        self._reset_terminal_pulse()
+        return PumpCommand.safe_stop()
 
+    def _automatic_lift_command(
+        self, now: float, height_mm: float, error: float
+    ) -> PumpCommand:
+        """执行既有粗升、量化P控制和末端脉冲路径。"""
         self._stable_since = None
         if self._terminal_pulse_phase is not None:
             # 已开始的停泵/脉冲序列优先于重新切区；否则轻微回落可绕过观察期。
@@ -776,6 +849,56 @@ class HeightController:
             return self._lift_command(pwm, height_mm)
 
         return self._terminal_pulse_command(now, height_mm)
+
+    def _automatic_lower_command(
+        self, now: float, height_mm: float, distance_mm: float
+    ) -> PumpCommand:
+        """按目标上方距离选择连续下降或末端停阀微脉冲。"""
+        self._stable_since = None
+        if self._lower_phase is not None:
+            return self._lower_terminal_command(now)
+        if distance_mm > self.config.lower_terminal_zone_mm:
+            self.state = ControllerState.COARSE_LOWER
+            return PumpCommand(
+                interlock=True,
+                lower_valve=self.calibration.lower_comfortable_valve,
+            )
+
+        # 连续下降切入末端区时必须先严格全零观察，不能把前一段阀动作
+        # 当成微脉冲的一部分，否则液压惯性会令50 ms脉冲失去边界。
+        self._lower_phase = _LowerPulsePhase.SETTLE
+        self._lower_phase_started = now
+        self.state = ControllerState.LOWER_SETTLE
+        return PumpCommand.safe_stop()
+
+    def _lower_terminal_command(self, now: float) -> PumpCommand:
+        """在全零观察和确认阀值微脉冲之间推进下降末端相位。"""
+        assert self._lower_phase is not None
+        assert self._lower_phase_started is not None
+        elapsed = now - self._lower_phase_started
+        if self._lower_phase is _LowerPulsePhase.SETTLE:
+            self.state = ControllerState.LOWER_SETTLE
+            if elapsed + 1e-12 < self.config.lower_pulse_wait_s:
+                return PumpCommand.safe_stop()
+            self._lower_phase = _LowerPulsePhase.ON
+            self._lower_phase_started = now
+            self.state = ControllerState.LOWER_PULSE
+            return PumpCommand(
+                interlock=True,
+                lower_valve=self.calibration.lower_comfortable_valve,
+            )
+
+        self.state = ControllerState.LOWER_PULSE
+        if elapsed + 1e-12 < self.config.lower_pulse_on_s:
+            return PumpCommand(
+                interlock=True,
+                lower_valve=self.calibration.lower_comfortable_valve,
+            )
+        # 通阀边界到达的本周期立即全零，并从该时刻重新累计完整观察期。
+        self._lower_phase = _LowerPulsePhase.SETTLE
+        self._lower_phase_started = now
+        self.state = ControllerState.LOWER_SETTLE
+        return PumpCommand.safe_stop()
 
     def _terminal_pulse_command(self, now: float, height_mm: float) -> PumpCommand:
         """先消除连续运动惯性，再按通泵/全零观察相位推进末端起升。"""
@@ -823,6 +946,11 @@ class HeightController:
         self._terminal_pulse_phase = None
         self._pulse_phase_started = None
         self._active_pulse_on_s = None
+
+    def _reset_lower_pulse(self) -> None:
+        """清除下降末端相位；下一次进入末端区必须重新全零观察。"""
+        self._lower_phase = None
+        self._lower_phase_started = None
 
     def _lift_command(self, pwm: int, height_mm: float) -> PumpCommand:
         limit_reason = self._lift_upper_limit_reason(height_mm)
@@ -885,6 +1013,8 @@ class HeightController:
         self._fault_clear_requested = False
         self._stable_since = None
         self._reset_terminal_pulse()
+        self._reset_lower_pulse()
+        self._approach_direction = None
         self._overcurrent_since = None
         self._record_actual_command(PumpCommand.safe_stop())
         return self._last_command
