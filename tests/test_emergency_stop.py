@@ -43,12 +43,63 @@ def test_trigger_latches_first_reason_and_time() -> None:
     assert clock_calls == [12.5]
 
 
-@pytest.mark.parametrize("reason", ["", None, 1])
+@pytest.mark.parametrize("reason", ["", " ", "\t\n", None, 1])
 def test_trigger_rejects_invalid_reason(reason: object) -> None:
     latch = EmergencyStopLatch()
 
     with pytest.raises((TypeError, ValueError)):
         latch.trigger(reason)  # type: ignore[arg-type]
+
+
+def test_clock_exception_does_not_partially_trigger_and_retry_can_succeed() -> None:
+    calls = 0
+
+    def clock() -> float:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("clock unavailable")
+        return 8.5
+
+    latch = EmergencyStopLatch(clock=clock)
+
+    with pytest.raises(RuntimeError, match="clock unavailable"):
+        latch.trigger("first attempt")
+
+    assert latch.snapshot() == EmergencyStopSnapshot(False, None, None, False, None)
+
+    latch.trigger("second attempt")
+
+    assert latch.snapshot() == EmergencyStopSnapshot(True, "second attempt", 8.5, False, None)
+
+
+@pytest.mark.parametrize(
+    ("invalid_time", "error_type"),
+    [
+        (True, TypeError),
+        ("1.0", TypeError),
+        (None, TypeError),
+        (float("nan"), ValueError),
+        (float("inf"), ValueError),
+        (float("-inf"), ValueError),
+        (-0.1, ValueError),
+    ],
+)
+def test_invalid_clock_result_does_not_partially_trigger_and_retry_can_succeed(
+    invalid_time: object,
+    error_type: type[Exception],
+) -> None:
+    clock_results = iter([invalid_time, 9.5])
+    latch = EmergencyStopLatch(clock=lambda: next(clock_results))  # type: ignore[arg-type]
+
+    with pytest.raises(error_type):
+        latch.trigger("first attempt")
+
+    assert latch.snapshot() == EmergencyStopSnapshot(False, None, None, False, None)
+
+    latch.trigger("second attempt")
+
+    assert latch.snapshot() == EmergencyStopSnapshot(True, "second attempt", 9.5, False, None)
 
 
 def test_clear_is_idempotent_while_inactive() -> None:
@@ -94,6 +145,18 @@ def test_nonzero_command_cannot_prove_post_trigger_zero_send(
         latch.clear()
 
 
+def test_nonzero_send_after_zero_send_revokes_clear_evidence() -> None:
+    latch = EmergencyStopLatch()
+    latch.trigger("limit switch")
+    latch.record_send_success(PumpCommand.safe_stop())
+
+    latch.record_send_success(PumpCommand(lift_pwm=1))
+
+    assert latch.snapshot().zero_sent_after_trigger is False
+    with pytest.raises(RuntimeError, match="全零"):
+        latch.clear()
+
+
 def test_transport_fault_must_be_explicitly_recovered_before_clear() -> None:
     latch = EmergencyStopLatch()
     latch.trigger("sensor timeout")
@@ -111,6 +174,20 @@ def test_transport_fault_must_be_explicitly_recovered_before_clear() -> None:
     latch.clear()
 
     assert latch.snapshot() == EmergencyStopSnapshot(False, None, None, False, None)
+
+
+@pytest.mark.parametrize("reason", ["", " ", "\t\n", None, 1])
+def test_active_transport_fault_rejects_invalid_reason_without_losing_fault(
+    reason: object,
+) -> None:
+    latch = EmergencyStopLatch()
+    latch.trigger("sensor timeout")
+    latch.record_transport_fault("CAN send failed")
+
+    with pytest.raises((TypeError, ValueError)):
+        latch.record_transport_fault(reason)  # type: ignore[arg-type]
+
+    assert latch.snapshot().transport_fault == "CAN send failed"
 
 
 def test_transport_updates_are_ignored_while_inactive() -> None:

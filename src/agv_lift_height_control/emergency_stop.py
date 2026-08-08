@@ -2,10 +2,29 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from math import isfinite
+from numbers import Real
 from threading import RLock
 from time import monotonic
 
 from .types import PumpCommand
+
+
+def _require_nonblank_reason(reason: object, field_name: str) -> str:
+    if not isinstance(reason, str):
+        raise TypeError(f"{field_name}必须是 str")
+    if not reason.strip():
+        raise ValueError(f"{field_name}不能为空白")
+    return reason
+
+
+def _validated_timestamp(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError("clock 必须返回实数，不能是 bool")
+    timestamp = float(value)
+    if not isfinite(timestamp) or timestamp < 0:
+        raise ValueError("clock 必须返回有限非负时间")
+    return timestamp
 
 
 @dataclass(frozen=True)
@@ -44,17 +63,16 @@ class EmergencyStopLatch:
 
     def trigger(self, reason: str) -> None:
         """锁存第一次急停原因和时间；后续触发不得覆盖事故首因。"""
-        if not isinstance(reason, str):
-            raise TypeError("急停原因必须是 str")
-        if reason == "":
-            raise ValueError("急停原因不能为空")
+        reason = _require_nonblank_reason(reason, "急停原因")
 
         with self._lock:
             if self._active:
                 return
+            # 时钟获取和校验必须先完成，异常时不得留下 active/reason 半提交状态。
+            triggered_at = _validated_timestamp(self._clock())
             self._active = True
             self._reason = reason
-            self._triggered_at = self._clock()
+            self._triggered_at = triggered_at
             # 新一轮急停必须重新取得触发后的全零发送证据，不能沿用旧状态。
             self._zero_sent_after_trigger = False
             self._transport_fault = None
@@ -62,14 +80,15 @@ class EmergencyStopLatch:
     def record_send_success(self, command: PumpCommand) -> None:
         """记录发送成功；仅急停后的完整全零命令可作为解除证据。"""
         with self._lock:
-            if self._active and command == PumpCommand.safe_stop():
-                self._zero_sent_after_trigger = True
+            if self._active:
+                # 证据代表急停后最后一次成功帧；后续非零成功帧必须立即撤销证据。
+                self._zero_sent_after_trigger = command == PumpCommand.safe_stop()
 
     def record_transport_fault(self, reason: str) -> None:
         """在急停期间锁存当前传输故障，直至调用恢复接口。"""
         with self._lock:
             if self._active:
-                self._transport_fault = reason
+                self._transport_fault = _require_nonblank_reason(reason, "传输故障原因")
 
     def record_transport_recovered(self) -> None:
         """显式确认急停期间的传输链路已经恢复。"""
