@@ -34,7 +34,7 @@ def complete_lift_trials() -> tuple[LiftTrial, ...]:
         LiftTrial(
             pwm=40,
             repeat=repeat,
-            start_delay_s=0.04 + repeat / 100,
+            start_delay_s=0.10 + repeat * 0.02,
             displacement_mm=4.0 + repeat,
             speed_mm_s=(4.0 + repeat) / 0.1,
             coast_mm=1.0 + repeat / 2,
@@ -59,18 +59,26 @@ def complete_lower_trials() -> tuple[LowerTrial, ...]:
     )
 
 
-def test_lift_analysis_accepts_exactly_three_40_percent_trials() -> None:
+def test_lift_analysis_accepts_delayed_settled_displacement() -> None:
     result = analyze_lift_trials(complete_lift_trials())
 
     assert LIFT_PWM_LEVELS == tuple(range(40, 81, 5))
     assert result.min_stable_pwm == 40
     assert result.coarse_pwm == 40
-    assert result.response_delay_s == pytest.approx(0.07)
+    assert result.response_delay_s == pytest.approx(0.16)
     assert result.max_coast_mm == pytest.approx(2.5)
     assert result.peak_current_by_pwm == {40: 930}
 
     with pytest.raises(CalibrationError, match="40%.*3"):
         analyze_lift_trials(complete_lift_trials()[:-1])
+
+
+def test_lift_analysis_rejects_response_later_than_controller_limit() -> None:
+    delayed = list(complete_lift_trials())
+    delayed[1] = replace(delayed[1], start_delay_s=0.301, success=False)
+
+    with pytest.raises(CalibrationError, match="响应延迟.*300 ms"):
+        analyze_lift_trials(tuple(delayed))
 
 
 def test_lift_analysis_rejects_noncanonical_pwm_and_failed_trial() -> None:

@@ -25,6 +25,7 @@ LIFT_CALIBRATION_REPEATS = 3
 LIFT_PULSE_S = 0.1
 LIFT_SETTLE_S = 0.7
 LIFT_TRIAL_S = LIFT_PULSE_S + LIFT_SETTLE_S
+LIFT_MAX_RESPONSE_DELAY_S = 0.3
 LIFT_CALIBRATION_PLAN = tuple(
     (LIFT_CALIBRATION_PWM, repeat)
     for repeat in range(1, LIFT_CALIBRATION_REPEATS + 1)
@@ -69,7 +70,9 @@ class LiftTrial:
     def __post_init__(self) -> None:
         _strict_int("pwm", self.pwm, 0, 100)
         _strict_int("repeat", self.repeat, 1, 3)
-        _finite_number("start_delay_s", self.start_delay_s, minimum=0)
+        delay = _finite_number("start_delay_s", self.start_delay_s, minimum=0)
+        if delay > LIFT_TRIAL_S:
+            raise CalibrationError("start_delay_s 不得超过完整起升试验周期")
         _finite_number("displacement_mm", self.displacement_mm)
         _finite_number("speed_mm_s", self.speed_mm_s)
         _finite_number("coast_mm", self.coast_mm, minimum=0)
@@ -130,12 +133,16 @@ def analyze_lift_trials(trials: tuple[LiftTrial, ...]) -> LiftCalibrationResult:
     if actual != LIFT_CALIBRATION_PLAN:
         raise CalibrationError("起升标定必须严格包含 40% PWM 的 3 次试验")
     if any(
-        not trial.success
-        or not trial.direction_consistent
-        or trial.displacement_mm < 1.0
+        not trial.direction_consistent or trial.displacement_mm < 1.0
         for trial in trials
     ):
-        raise CalibrationError("40% PWM 的三次起升必须都同向且通电位移至少 1 mm")
+        raise CalibrationError(
+            "40% PWM 的三次起升必须都同向且观察结束净位移至少 1 mm"
+        )
+    if any(trial.start_delay_s > LIFT_MAX_RESPONSE_DELAY_S for trial in trials):
+        raise CalibrationError("起升响应延迟超过闭环允许的 300 ms")
+    if any(not trial.success for trial in trials):
+        raise CalibrationError("起升试验成功标志与实测门禁不一致")
 
     return LiftCalibrationResult(
         min_stable_pwm=LIFT_CALIBRATION_PWM,
