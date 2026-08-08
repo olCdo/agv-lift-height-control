@@ -21,6 +21,7 @@ from .types import HeightSample, PumpCommand, PumpFeedback
 
 LIFT_PWM_LEVELS = tuple(range(40, 81, 5))
 LIFT_CALIBRATION_PWM = 40
+LIFT_PRECHARGE_REPEATS = 1
 LIFT_CALIBRATION_REPEATS = 3
 LIFT_PULSE_S = 0.1
 LIFT_SETTLE_S = 0.7
@@ -242,7 +243,7 @@ def _validate_session_inputs(
 
 
 class LiftCalibrationSession:
-    """执行三次固定 40% 短脉冲；通电授权与全零观察相互独立。"""
+    """先预充压，再执行三次固定 40% 短脉冲及完整全零观察。"""
 
     def __init__(
         self,
@@ -256,6 +257,8 @@ class LiftCalibrationSession:
             "direction_tolerance_mm", direction_tolerance_mm, minimum=0
         )
         self._index = 0
+        self._precharge_count = 0
+        self._awaiting_authorization_release = False
         self._trials: list[LiftTrial] = []
         self._sensor_timeout_s = _session_timeout(
             "sensor_timeout_s", sensor_timeout_s, 0.1
@@ -281,7 +284,10 @@ class LiftCalibrationSession:
 
     @property
     def done(self) -> bool:
-        return self._index >= LIFT_CALIBRATION_REPEATS
+        return (
+            self._precharge_count >= LIFT_PRECHARGE_REPEATS
+            and self._index >= LIFT_CALIBRATION_REPEATS
+        )
 
     @property
     def trials(self) -> tuple[LiftTrial, ...]:
@@ -302,6 +308,10 @@ class LiftCalibrationSession:
             return PumpCommand.safe_stop()
         if self.done:
             return PumpCommand.safe_stop()
+        if self._active_started_at is None and self._awaiting_authorization_release:
+            if not lift_authorized:
+                self._awaiting_authorization_release = False
+            return PumpCommand.safe_stop()
         if self._active_started_at is None and not lift_authorized:
             return PumpCommand.safe_stop()
         try:
@@ -319,6 +329,11 @@ class LiftCalibrationSession:
         self._last_now = timestamp
         if height >= self._absolute_max_height_mm:
             return self._fail("起升标定高度达到绝对上限")
+        if (
+            self._active_started_at is not None
+            and height < self._start_height - self._direction_tolerance_mm
+        ):
+            return self._fail("起升标定期间高度方向反向")
         self.fault_reason = None
         if self._active_started_at is None:
             self._begin(timestamp, height, checked_feedback)
@@ -333,26 +348,22 @@ class LiftCalibrationSession:
             if not lift_authorized:
                 self._reset_active()
                 return PumpCommand.safe_stop()
-            if height < self._start_height - self._direction_tolerance_mm:
-                return self._fail("起升标定期间高度方向反向")
             self._observe_powered(timestamp, height, checked_feedback)
             return PumpCommand(interlock=True, lift_pwm=self._current_pwm())
 
         if self._stop_height is None:
-            if height < self._start_height - self._direction_tolerance_mm:
-                return self._fail("起升标定期间高度方向反向")
             self._observe_powered(timestamp, height, checked_feedback)
             self._stop_height = height
             self._highest_settle_height = height
         else:
+            self._observe_motion(timestamp, height)
             self._highest_settle_height = max(self._highest_settle_height, height)
 
         if elapsed + 1e-12 < LIFT_TRIAL_S:
             return PumpCommand.safe_stop()
 
-        self._finish()
-        # 即使观察结束时授权仍有效，也先保持一个全零周期；下一次 step
-        # 再根据最新的 700 ms 死手租约决定是否开始下一脉冲。
+        self._finish(height)
+        # 每个完整周期都必须先观察到授权释放，再允许新的按键事件开始下一脉冲。
         return PumpCommand.safe_stop()
 
     def _current_pwm(self) -> int:
@@ -371,36 +382,55 @@ class LiftCalibrationSession:
     def _observe_powered(
         self, now: float, height: float, feedback: PumpFeedback | None
     ) -> None:
-        self._lowest_height = min(self._lowest_height, height)
+        self._observe_motion(now, height)
         if feedback is not None:
             self._peak_current = max(self._peak_current, abs(feedback.current_raw))
+
+    def _observe_motion(self, now: float, height: float) -> None:
+        """在完整周期内跟踪方向和首次可测运动，不采集停泵后的电流。"""
+        self._lowest_height = min(self._lowest_height, height)
         if self._first_movement_at is None and height - self._start_height >= 0.1:
             self._first_movement_at = now
 
-    def _finish(self) -> None:
+    def _finish(self, final_height: float) -> None:
+        """结束预充压或保存一条以观察末高度为准的正式试验。"""
         assert self._active_started_at is not None
         assert self._stop_height is not None
-        displacement = self._stop_height - self._start_height
-        direction_ok = self._lowest_height >= self._start_height - self._direction_tolerance_mm
+        displacement = final_height - self._start_height
+        direction_ok = (
+            self._lowest_height
+            >= self._start_height - self._direction_tolerance_mm
+        )
         delay = (
             self._first_movement_at - self._active_started_at
             if self._first_movement_at is not None
-            else LIFT_PULSE_S
+            else LIFT_TRIAL_S
         )
-        self._trials.append(
-            LiftTrial(
-                pwm=self._current_pwm(),
-                repeat=self._index % 3 + 1,
-                start_delay_s=min(max(delay, 0.0), LIFT_PULSE_S),
-                displacement_mm=displacement,
-                speed_mm_s=max(0.0, displacement) / LIFT_PULSE_S,
-                coast_mm=max(0.0, self._highest_settle_height - self._stop_height),
-                peak_current_raw=self._peak_current,
-                direction_consistent=direction_ok,
-                success=direction_ok and displacement >= 1.0,
+        if self._precharge_count < LIFT_PRECHARGE_REPEATS:
+            self._precharge_count += 1
+        else:
+            self._trials.append(
+                LiftTrial(
+                    pwm=self._current_pwm(),
+                    repeat=self._index + 1,
+                    start_delay_s=max(delay, 0.0),
+                    displacement_mm=displacement,
+                    speed_mm_s=max(0.0, displacement) / LIFT_PULSE_S,
+                    coast_mm=max(
+                        0.0, self._highest_settle_height - self._stop_height
+                    ),
+                    peak_current_raw=self._peak_current,
+                    direction_consistent=direction_ok,
+                    success=(
+                        direction_ok
+                        and displacement >= 1.0
+                        and self._first_movement_at is not None
+                        and delay <= LIFT_MAX_RESPONSE_DELAY_S
+                    ),
+                )
             )
-        )
-        self._index += 1
+            self._index += 1
+        self._awaiting_authorization_release = True
         self._reset_active()
 
     def _reset_active(self) -> None:
