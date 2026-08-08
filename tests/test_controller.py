@@ -183,6 +183,23 @@ def test_terminal_authorization_loss_restarts_with_full_settle() -> None:
     assert step(controller, 1.36, 100.0).lift_pwm == 50
 
 
+def test_terminal_settle_cannot_be_bypassed_by_small_downward_drift() -> None:
+    controller = HeightController(control_config(), calibration(coast=5.0))
+    controller.set_target(115.0)
+
+    assert step(controller, 0.0, 100.0) == PumpCommand.safe_stop()
+    # 轻微回落让误差重新大于15 mm，也必须先完成已经开始的停泵观察。
+    assert step(controller, 0.05, 99.9) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.TERMINAL_PULSE
+    for index in range(2, 13):
+        assert step(controller, index / 20, 99.9) == PumpCommand.safe_stop()
+    assert step(controller, 0.64, 99.9) == PumpCommand.safe_stop()
+
+    resumed = step(controller, 0.65, 99.9)
+    assert controller.state is ControllerState.P_CONTROL
+    assert resumed.lift_pwm > 0
+
+
 def test_target_requires_500ms_continuous_tolerance_before_hold() -> None:
     controller = HeightController(control_config(), calibration())
     controller.set_target(100.0)

@@ -671,6 +671,9 @@ class HeightController:
             return PumpCommand.hydraulic_hold()
 
         self._stable_since = None
+        if self._terminal_pulse_phase is not None:
+            # 已开始的停泵/脉冲序列优先于重新切区；否则轻微回落可绕过观察期。
+            return self._terminal_pulse_command(now, height_mm)
         if error > self.slow_zone_mm:
             self.state = ControllerState.COARSE_LIFT
             self._reset_terminal_pulse()
@@ -717,6 +720,11 @@ class HeightController:
         }:
             if elapsed + 1e-12 < self.pulse_wait_s:
                 return PumpCommand.safe_stop()
+            assert self._target_mm is not None
+            if self._target_mm - height_mm > self.pulse_zone_mm:
+                # 完整观察后才允许按实时误差重新回到P控制或粗升。
+                self._reset_terminal_pulse()
+                return self._automatic_command(now, height_mm)
             self._terminal_pulse_phase = _TerminalPulsePhase.ON
             self._pulse_phase_started = now
             return self._lift_command(self.calibration.min_stable_pwm, height_mm)
