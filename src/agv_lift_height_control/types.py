@@ -50,6 +50,11 @@ class PumpCommand:
             raise ValueError(f"{name} 必须在 {minimum}..{maximum} 范围内")
 
     @classmethod
+    def hydraulic_hold(cls) -> "PumpCommand":
+        """返回只启用互锁的正常保持命令；不得用于故障、超时或退出。"""
+        return cls(interlock=True)
+
+    @classmethod
     def safe_stop(cls) -> "PumpCommand":
         """返回不使能且所有输出为零的安全停机命令。"""
         return cls()

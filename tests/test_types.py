@@ -16,6 +16,11 @@ def test_pump_command_defaults_and_safe_stop() -> None:
     assert PumpCommand.safe_stop() == PumpCommand(False, 0, 0, 0, 0)
 
 
+def test_hydraulic_hold_enables_only_interlock_and_safe_stop_remains_all_zero() -> None:
+    assert PumpCommand.hydraulic_hold() == PumpCommand(True, 0, 0, 0, 0)
+    assert PumpCommand.safe_stop() == PumpCommand(False, 0, 0, 0, 0)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

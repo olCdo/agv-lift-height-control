@@ -344,6 +344,7 @@ def test_encode_command_and_nmt_payloads_follow_protocol_layout() -> None:
     encode_nmt = api("encode_nmt_start")
 
     assert encode_command(PumpCommand(True, 37, 8, 9, 64)) == bytes([1, 37, 8, 9, 64, 0, 0, 0])
+    assert encode_command(PumpCommand.hydraulic_hold()) == bytes([1, 0, 0, 0, 0, 0, 0, 0])
     assert encode_command(PumpCommand.safe_stop()) == bytes(8)
     assert encode_nmt() == bytes([0x01, 0x00])
 
