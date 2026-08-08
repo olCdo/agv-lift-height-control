@@ -622,6 +622,23 @@ def test_emergency_stop_cancels_target_and_blocks_all_normal_motion_requests() -
     assert controller.state is ControllerState.EMERGENCY_STOP
 
 
+def test_emergency_stop_overrides_normal_step_before_any_input_validation() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.enter_emergency_stop("普通控制周期急停")
+
+    command = controller.step(
+        now=math.nan,
+        sample=None,  # type: ignore[arg-type]
+        feedback="bad feedback",  # type: ignore[arg-type]
+        lift_authorized="yes",  # type: ignore[arg-type]
+        lower_authorized=None,  # type: ignore[arg-type]
+    )
+
+    assert command == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.EMERGENCY_STOP
+    assert controller.emergency_stop_reason == "普通控制周期急停"
+
+
 def test_emergency_stop_overrides_external_mode_before_any_input_validation() -> None:
     controller = HeightController(control_config(), calibration())
     controller.enter_external_mode(ControllerState.SURVEY)
