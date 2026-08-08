@@ -182,6 +182,23 @@ def test_tui_render_shows_fault_code_in_protocol_hex_and_decimal() -> None:
     assert "故障码: 0x52 (82)" in output.getvalue()
 
 
+def test_tui_render_shows_actual_and_desired_interlock_state() -> None:
+    output = io.StringIO()
+    terminal = PosixAnsiTerminal(stdout=output)
+
+    terminal.render(
+        RuntimeSnapshot(
+            mode="move",
+            command=PumpCommand.hydraulic_hold(),
+            desired_command=PumpCommand.safe_stop(),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "实际输出: 互锁=开 PWM=0" in rendered
+    assert "期望输出: 互锁=关 PWM=0" in rendered
+
+
 class TtyFdStream:
     def __init__(self, descriptor: int) -> None:
         self.descriptor = descriptor

@@ -155,9 +155,11 @@ class PosixAnsiTerminal:
             f"模式: {snapshot.mode}    状态: {snapshot.controller_state or '-'}",
             f"高度: {_show(sample.height_mm if sample else None)} mm    raw: {_show(sample.raw_count if sample else None)}",
             f"目标: {_show(snapshot.target_mm)} mm    误差: {_show(snapshot.target_error_mm)} mm",
-            f"实际输出: PWM={snapshot.command.lift_pwm} 阀值=0x{snapshot.command.lower_valve:02X} "
+            f"实际输出: 互锁={'开' if snapshot.command.interlock else '关'} "
+            f"PWM={snapshot.command.lift_pwm} 阀值=0x{snapshot.command.lower_valve:02X} "
             f"加速={snapshot.command.accel} 减速={snapshot.command.decel}",
-            f"期望输出: PWM={snapshot.desired_command.lift_pwm} "
+            f"期望输出: 互锁={'开' if snapshot.desired_command.interlock else '关'} "
+            f"PWM={snapshot.desired_command.lift_pwm} "
             f"阀值=0x{snapshot.desired_command.lower_valve:02X} "
             f"归零请求={'是' if snapshot.zero_requested else '否'}",
             f"泵电流: {_show(feedback.current_raw if feedback else None)}    "
