@@ -23,11 +23,11 @@ from .calibration import (
     analyze_lower_trials,
 )
 
-DRAFT_SCHEMA_VERSION = 2
+DRAFT_SCHEMA_VERSION = 3
 
 
 class CalibrationDraftStore:
-    """原子保存三次短脉冲起升结果，不迁移旧版 27 次动作草稿。"""
+    """原子保存最终净位移语义的起升结果，不迁移旧版动作草稿。"""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -93,7 +93,14 @@ def _result_to_json(result: LiftCalibrationResult) -> dict[str, object]:
 def _result_from_json(raw: object) -> LiftCalibrationResult:
     if type(raw) is not dict or set(raw) != {"schema_version", "lift"}:
         raise CalibrationError("起升草稿字段不完整或包含未知字段")
-    if type(raw["schema_version"]) is not int or raw["schema_version"] != DRAFT_SCHEMA_VERSION:
+    schema_version = raw["schema_version"]
+    if type(schema_version) is not int:
+        raise CalibrationError("不支持的起升草稿 schema_version")
+    if schema_version in {1, 2}:
+        raise CalibrationError(
+            "旧版起升草稿字段语义已失效；请重新执行起升标定"
+        )
+    if schema_version != DRAFT_SCHEMA_VERSION:
         raise CalibrationError("不支持的起升草稿 schema_version")
     lift = raw["lift"]
     lift_fields = {

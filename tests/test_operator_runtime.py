@@ -399,20 +399,23 @@ def test_calibration_draft_roundtrip_preserves_complete_trials(tmp_path) -> None
 
     assert store.load_lift() == expected
     raw = json.loads(store.path.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == 2
+    assert raw["schema_version"] == 3
     assert len(raw["lift"]["trials"]) == 3
     assert raw["lift"]["peak_current_by_pwm"] == {"40": 143}
 
 
-def test_calibration_draft_rejects_old_v1_without_reinterpreting_it(tmp_path) -> None:
+@pytest.mark.parametrize("old_version", [1, 2])
+def test_calibration_draft_rejects_old_lift_semantics(
+    tmp_path, old_version: int
+) -> None:
     path = tmp_path / "lift-draft.json"
     store = CalibrationDraftStore(path)
     store.save_lift(_lift_result())
     raw = json.loads(path.read_text(encoding="utf-8"))
-    raw["schema_version"] = 1
+    raw["schema_version"] = old_version
     path.write_text(json.dumps(raw), encoding="utf-8")
 
-    with pytest.raises(CalibrationError, match="schema_version"):
+    with pytest.raises(CalibrationError, match="旧版.*重新执行起升标定"):
         store.load_lift()
 
 
