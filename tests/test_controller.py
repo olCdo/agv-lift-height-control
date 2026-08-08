@@ -118,31 +118,69 @@ def test_control_zones_derive_from_coast_and_use_deterministic_boundaries() -> N
     controller.set_target(115.0)
     pulse = step(controller, 0.0, 100.0)
     assert controller.state is ControllerState.TERMINAL_PULSE
-    assert pulse.lift_pwm == 50
+    assert pulse == PumpCommand.safe_stop()
 
 
-@pytest.mark.parametrize("target_mm", [200.0, 150.0, 115.0])
-def test_single_level_calibration_never_commands_above_40(target_mm: float) -> None:
+@pytest.mark.parametrize(
+    ("target_mm", "expected_pwm"),
+    [(200.0, 40), (150.0, 40), (115.0, 0)],
+)
+def test_single_level_calibration_never_commands_above_40(
+    target_mm: float, expected_pwm: int
+) -> None:
     controller = HeightController(control_config(), single_level_calibration())
     controller.set_target(target_mm)
 
     command = step(controller, 0.0, 100.0)
 
-    assert command.lift_pwm == 40
+    assert command.lift_pwm == expected_pwm
 
 
-def test_terminal_pulse_uses_clamped_response_and_wait_phases() -> None:
+def test_field_transition_from_continuous_lift_stops_before_terminal_pulse() -> None:
+    controller = HeightController(control_config(), single_level_calibration())
+    controller.set_target(80.0)
+
+    moving = step(controller, 0.0, 46.337890625)
+    assert controller.state is ControllerState.P_CONTROL
+    assert moving == PumpCommand(interlock=True, lift_pwm=40)
+
+    terminal_entry = step(controller, 0.08, 68.505859375)
+    assert controller.state is ControllerState.TERMINAL_PULSE
+    assert terminal_entry == PumpCommand.safe_stop()
+
+
+def test_terminal_pulse_settles_before_first_on_and_waits_after_each_pulse() -> None:
     controller = HeightController(control_config(), calibration())
     controller.set_target(110.0)
 
     assert controller.pulse_on_s == pytest.approx(0.15)
     assert controller.pulse_wait_s == pytest.approx(0.65)
-    assert step(controller, 0.0, 100.0).lift_pwm == 50
-    assert step(controller, 0.1, 100.0).lift_pwm == 50
-    assert step(controller, 0.15, 100.0).lift_pwm == 0
-    for now in (0.25, 0.35, 0.45, 0.55, 0.65, 0.75):
-        assert step(controller, now, 100.0).lift_pwm == 0
-    assert step(controller, 0.8, 100.0).lift_pwm == 50
+    for index in range(13):
+        assert step(controller, index / 20, 100.0) == PumpCommand.safe_stop()
+    assert step(controller, 0.64, 100.0) == PumpCommand.safe_stop()
+    assert step(controller, 0.65, 100.0).lift_pwm == 50
+    assert step(controller, 0.70, 100.0).lift_pwm == 50
+    assert step(controller, 0.75, 100.0).lift_pwm == 50
+    assert step(controller, 0.79, 100.0).lift_pwm == 50
+    assert step(controller, 0.80, 100.0) == PumpCommand.safe_stop()
+    for index in range(12):
+        assert step(controller, 0.85 + index / 20, 100.0) == PumpCommand.safe_stop()
+    assert step(controller, 1.44, 100.0) == PumpCommand.safe_stop()
+    assert step(controller, 1.45, 100.0).lift_pwm == 50
+
+
+def test_terminal_authorization_loss_restarts_with_full_settle() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(110.0)
+
+    for index in range(13):
+        assert step(controller, index / 20, 100.0) == PumpCommand.safe_stop()
+    assert step(controller, 0.65, 100.0).lift_pwm == 50
+    assert step(controller, 0.70, 100.0, lift_authorized=False) == PumpCommand.safe_stop()
+    for index in range(13):
+        assert step(controller, 0.71 + index / 20, 100.0) == PumpCommand.safe_stop()
+    assert step(controller, 1.35, 100.0) == PumpCommand.safe_stop()
+    assert step(controller, 1.36, 100.0).lift_pwm == 50
 
 
 def test_target_requires_500ms_continuous_tolerance_before_hold() -> None:

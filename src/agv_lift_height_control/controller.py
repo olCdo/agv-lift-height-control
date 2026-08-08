@@ -28,6 +28,12 @@ class ControllerState(str, Enum):
     FAULT = "fault"
 
 
+class _TerminalPulsePhase(str, Enum):
+    SETTLE = "settle"
+    ON = "on"
+    WAIT = "wait"
+
+
 EXTERNAL_CONTROLLER_STATES = frozenset(
     {
         ControllerState.LIFT_CALIBRATION,
@@ -86,6 +92,7 @@ class HeightController:
         self._manual_lower = False
         self._fault_clear_requested = False
         self._stable_since: float | None = None
+        self._terminal_pulse_phase: _TerminalPulsePhase | None = None
         self._pulse_phase_started: float | None = None
         self._last_step_at: float | None = None
         self._last_sample: HeightSample | None = None
@@ -135,7 +142,7 @@ class HeightController:
         self._effective_upper_limit_mm = effective
         self._manual_lower = False
         self._stable_since = None
-        self._pulse_phase_started = None
+        self._reset_terminal_pulse()
         self.trial_failed = False
         if self.state is not ControllerState.FAULT:
             self.state = ControllerState.IDLE
@@ -145,7 +152,7 @@ class HeightController:
         self._target_mm = None
         self._manual_lower = False
         self._stable_since = None
-        self._pulse_phase_started = None
+        self._reset_terminal_pulse()
         self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
         self._record_actual_command(PumpCommand.safe_stop())
         if (
@@ -164,7 +171,7 @@ class HeightController:
         if active:
             self._target_mm = None
             self._stable_since = None
-            self._pulse_phase_started = None
+            self._reset_terminal_pulse()
             self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
             self._record_actual_command(PumpCommand.safe_stop())
         if self.state is not ControllerState.FAULT:
@@ -189,7 +196,7 @@ class HeightController:
         self._target_mm = None
         self._manual_lower = False
         self._stable_since = None
-        self._pulse_phase_started = None
+        self._reset_terminal_pulse()
         self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
         # 命令源所有权在此原子切换；旧自动命令的方向/过流历史不能污染
         # 外部标定或 Survey 状态，否则 controller.step 会把安全模式误锁故障。
@@ -267,9 +274,9 @@ class HeightController:
 
         command = self._automatic_command(timestamp, height)
         if command.lift_pwm and not lift_authorized:
-            # 未实际通电的脉冲不能继续计时，否则授权恢复时可能从等待相位开始。
+            # 通泵中撤权立即全零；再次授权必须重新完成停泵观察。
             if self.state is ControllerState.TERMINAL_PULSE:
-                self._pulse_phase_started = None
+                self._reset_terminal_pulse()
             command = safe_stop
         self._record_actual_command(command, height)
         return command
@@ -650,10 +657,10 @@ class HeightController:
             self.state = ControllerState.IDLE
             self.trial_failed = True
             self._stable_since = None
-            self._pulse_phase_started = None
+            self._reset_terminal_pulse()
             return PumpCommand.safe_stop()
         if abs(error) <= self.config.tolerance_mm:
-            self._pulse_phase_started = None
+            self._reset_terminal_pulse()
             if self._stable_since is None:
                 self._stable_since = now
             if now - self._stable_since + 1e-12 >= self.config.stable_time_s:
@@ -665,11 +672,11 @@ class HeightController:
         self._stable_since = None
         if error > self.slow_zone_mm:
             self.state = ControllerState.COARSE_LIFT
-            self._pulse_phase_started = None
+            self._reset_terminal_pulse()
             return self._lift_command(self.calibration.coarse_pwm, height_mm)
         if error > self.pulse_zone_mm:
             self.state = ControllerState.P_CONTROL
-            self._pulse_phase_started = None
+            self._reset_terminal_pulse()
             scale = (error - self.pulse_zone_mm) / (
                 self.slow_zone_mm - self.pulse_zone_mm
             )
@@ -691,16 +698,38 @@ class HeightController:
             pwm = next(measured_levels, self.calibration.coarse_pwm)
             return self._lift_command(pwm, height_mm)
 
-        if self.state is not ControllerState.TERMINAL_PULSE or self._pulse_phase_started is None:
-            self._pulse_phase_started = now
+        return self._terminal_pulse_command(now, height_mm)
+
+    def _terminal_pulse_command(self, now: float, height_mm: float) -> PumpCommand:
+        """先消除连续运动惯性，再按通泵/全零观察相位推进末端起升。"""
         self.state = ControllerState.TERMINAL_PULSE
+        if self._terminal_pulse_phase is None or self._pulse_phase_started is None:
+            # 从连续运动进入末端区时先停泵，不能把进入时刻当作新脉冲起点。
+            self._terminal_pulse_phase = _TerminalPulsePhase.SETTLE
+            self._pulse_phase_started = now
+            return PumpCommand.safe_stop()
+
         elapsed = now - self._pulse_phase_started
+        if self._terminal_pulse_phase in {
+            _TerminalPulsePhase.SETTLE,
+            _TerminalPulsePhase.WAIT,
+        }:
+            if elapsed + 1e-12 < self.pulse_wait_s:
+                return PumpCommand.safe_stop()
+            self._terminal_pulse_phase = _TerminalPulsePhase.ON
+            self._pulse_phase_started = now
+            return self._lift_command(self.calibration.min_stable_pwm, height_mm)
+
         if elapsed + 1e-12 < self.pulse_on_s:
             return self._lift_command(self.calibration.min_stable_pwm, height_mm)
-        if elapsed + 1e-12 < self.pulse_on_s + self.pulse_wait_s:
-            return PumpCommand.safe_stop()
+        self._terminal_pulse_phase = _TerminalPulsePhase.WAIT
         self._pulse_phase_started = now
-        return self._lift_command(self.calibration.min_stable_pwm, height_mm)
+        return PumpCommand.safe_stop()
+
+    def _reset_terminal_pulse(self) -> None:
+        """清除末端内部相位，保证下一次进入必定先执行停泵观察。"""
+        self._terminal_pulse_phase = None
+        self._pulse_phase_started = None
 
     def _lift_command(self, pwm: int, height_mm: float) -> PumpCommand:
         limit_reason = self._lift_upper_limit_reason(height_mm)
@@ -762,7 +791,7 @@ class HeightController:
         self.trial_failed = True
         self._fault_clear_requested = False
         self._stable_since = None
-        self._pulse_phase_started = None
+        self._reset_terminal_pulse()
         self._overcurrent_since = None
         self._record_actual_command(PumpCommand.safe_stop())
         return self._last_command
