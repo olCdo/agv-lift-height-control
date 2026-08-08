@@ -4,8 +4,10 @@ from agv_lift_height_control import (
     CalibrationBundle,
     ControlConfig,
     ControllerState,
+    EmergencyStopLatch,
     HeightController,
     HydraulicLiftSimulator,
+    LiftHeightControl,
     PumpCommand,
 )
 
@@ -150,3 +152,76 @@ def test_controller_reaches_three_targets_in_deterministic_hydraulic_simulation(
     assert controller.state is ControllerState.HOLD, controller.fault_reason
     assert abs(simulator.height_mm - target) <= 2.0
     assert maximum - target <= 5.0
+
+
+def test_public_control_reaches_lower_target_with_delay_and_coast() -> None:
+    simulator = HydraulicLiftSimulator(
+        initial_height_mm=200,
+        response_delay_s=0.15,
+        max_lower_speed_mm_s=90,
+        coast_decay_s=0.08,
+        fixed_step_s=0.05,
+    )
+    controller = HeightController(
+        control_config(), calibration(coast=5.0, response=0.15)
+    )
+    control = LiftHeightControl(
+        controller,
+        EmergencyStopLatch(clock=lambda: simulator.now),
+        clock=lambda: simulator.now,
+    )
+    control.set_target_height(80)
+    minimum = simulator.height_mm
+    lower_commands = 0
+
+    for _ in range(1200):
+        snapshot = simulator.observe()
+        command = control.update(snapshot.now, snapshot.sample, snapshot.feedback)
+        lower_commands += command.lower_valve > 0
+        snapshot = simulator.advance(command)
+        minimum = min(minimum, snapshot.height_mm)
+        if controller.state is ControllerState.HOLD:
+            break
+
+    assert lower_commands > 0
+    assert controller.state is ControllerState.HOLD, controller.fault_reason
+    assert minimum >= 75
+    assert 78 <= simulator.height_mm <= 82
+
+
+def test_public_control_emergency_stop_keeps_future_simulated_commands_safe() -> None:
+    simulator = HydraulicLiftSimulator(
+        initial_height_mm=200,
+        response_delay_s=0.15,
+        max_lower_speed_mm_s=90,
+        coast_decay_s=0.08,
+        fixed_step_s=0.05,
+    )
+    controller = HeightController(
+        control_config(), calibration(coast=5.0, response=0.15)
+    )
+    control = LiftHeightControl(
+        controller,
+        EmergencyStopLatch(clock=lambda: simulator.now),
+        clock=lambda: simulator.now,
+    )
+    control.set_target_height(80)
+
+    for _ in range(40):
+        snapshot = simulator.observe()
+        command = control.update(snapshot.now, snapshot.sample, snapshot.feedback)
+        snapshot = simulator.advance(command)
+        if snapshot.height_mm < 200:
+            break
+
+    assert simulator.height_mm < 200
+    control.emergency_stop("仿真运动中急停")
+
+    future_commands = []
+    for _ in range(40):
+        snapshot = simulator.observe()
+        command = control.update(snapshot.now, snapshot.sample, snapshot.feedback)
+        future_commands.append(command)
+        simulator.advance(command)
+
+    assert future_commands == [PumpCommand.safe_stop()] * 40
