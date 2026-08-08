@@ -126,6 +126,7 @@ python -m agv_lift_height_control --config "$CONFIG_PATH" --help
 | `observe-can` | 否 | 仅接收 | 默认被动观察 `0x197` 60 秒，不发送帧 |
 | `zero-can` | 否 | 是 | 只运行 NMT 和 `0x217` 全零窗口 |
 | `calibrate-lift` | 是 | 是 | 1 次预充压加 3 次固定 40% 正式测量，强制输入临时最大高度，完成后保存起升草稿 |
+| `prepare-lower` | 是 | 是 | 读取起升草稿，以固定 40% 短脉冲预升到指定传感器高度，不写标定文件 |
 | `calibrate-lower` | 是 | 是 | 使用当前起升草稿完成下降动作测量，保存下降草稿 |
 | `confirm-lower` | 否 | 否 | 根据已保存实测候选确认舒适下降阀值并生成最终标定包 |
 | `move` | 是 | 是 | 只自动起升到目标高度；没有持久软限位时还要给临时上限 |
@@ -195,7 +196,23 @@ python -m agv_lift_height_control --config "$CONFIG_PATH" calibrate-lift \
 `lift-calibration-draft.json`。当前只接受 schema v3 起升草稿；旧版 schema v1 的 27 次
 动作数据和 schema v2 的通电位移数据都不会被静默复用，更新后必须按本节重新标定。
 
-### 5. 下降动作标定与事后确认
+### 5. 为下降标定安全预升
+
+设备无法通过独立手动控制起升时，先使用已经通过的 schema v3 起升草稿准备下降行程。本次现场目标为传感器相对高度 100 mm，临时最大高度仍为 200 mm：
+
+```bash
+python -m agv_lift_height_control --config "$CONFIG_PATH" prepare-lower \
+  --target-mm 100 \
+  --temporary-max-mm 200
+```
+
+程序只使用草稿里的最低稳定 PWM（本次为 40%）。初始 5 秒 NMT 安全窗口保持全零；窗口结束且 `0x197` 新鲜无故障后，持续按住 `u` 才会推进动作。每次通泵 100 ms，随后强制保持全零观察 700 ms；即使通泵阶段授权中断，也必须完成观察期，不能靠快速重复按键拼成长时间通泵。
+
+高度达到 100 mm 后程序立即请求全零并安全退出，不会自动下降，也不会尝试保持在 100 mm。液压停泵后仍可能继续上滑，最终高度可能高于目标但不应超过起升草稿记录的最大上滑量；本次实测最大上滑约 4.297 mm。程序还要求目标加最大上滑不超过临时上限、已有持久软限位、配置绝对上限和 2900 mm 的最小值。
+
+该命令不会改写 `lift-calibration-draft.json`，不会生成下降草稿。运行前必须停止 OpenPLC 和其他 `0x217` 发送者，操作者必须在设备旁并能立即物理断电。
+
+### 6. 下降动作标定与事后确认
 
 ```bash
 python -m agv_lift_height_control --config "$CONFIG_PATH" calibrate-lower
@@ -211,7 +228,7 @@ python -m agv_lift_height_control --config "$CONFIG_PATH" show-calibration
 
 示例中的 `0x40` 不能照搬，必须选择本次输出的成功实测值。起升草稿被覆盖后，旧下降草稿会因指纹不匹配而拒绝确认。
 
-### 6. 三次低高度闭环定高
+### 7. 三次低高度闭环定高
 
 没有持久软限位时，每次 `move` 都必须提供临时上限：
 
@@ -225,7 +242,7 @@ python -m agv_lift_height_control --config "$CONFIG_PATH" move \
 末端脉冲都只会发送 40% PWM。达到目标后应连续 500 ms 保持在 ±2 mm；超调超过 5 mm
 会判失败。若需要下降，退出后单独运行 `manual-lower`，不要期待自动控制回降。
 
-### 7. 测量最高安全高度
+### 8. 测量最高安全高度
 
 ```bash
 read -r -p "输入本次上限测量临时最大高度(mm): " SURVEY_TEMP_MAX_MM
@@ -237,7 +254,7 @@ python -m agv_lift_height_control --config "$CONFIG_PATH" survey-upper \
 
 `最高观测高度 - max(50 mm, 2 × 最大滑行距离)`。
 
-### 8. 确认持久软上限
+### 9. 确认持久软上限
 
 人工审核测量结果后，选择一个不高于程序安全建议的具体值：
 
