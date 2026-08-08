@@ -1,7 +1,8 @@
 """无硬件依赖的混合闭环高度控制器。
 
-``step`` 的安全顺序固定为：输入与时序门禁 → 锁存故障处理 → 控制状态机 →
-授权门控。任何门禁失败都返回完整全零；运动授权缺失时禁止非零动作，但无故障的
+``step`` 与 ``step_external`` 都先执行急停门禁；急停状态在任何输入或时序校验前
+严格全零返回。非急停时的安全顺序为：输入与时序门禁 → 锁存故障处理 → 控制状态机
+→ 授权门控。任何门禁失败都返回完整全零；运动授权缺失时禁止非零动作，但无故障的
 目标稳定窗口允许只启用互锁的液压保持。本控制器永不因自动目标而下降。
 """
 
@@ -104,6 +105,7 @@ class HeightController:
         self._effective_upper_limit_mm = calibration.soft_upper_limit_mm
         self._manual_lower = False
         self._fault_clear_requested = False
+        self._fault_active_before_emergency_stop = False
         self._stable_since: float | None = None
         self._terminal_pulse_phase: _TerminalPulsePhase | None = None
         self._pulse_phase_started: float | None = None
@@ -220,6 +222,7 @@ class HeightController:
 
         # 急停是独立于普通故障的最高优先级状态；切入时必须同时撤销命令源所有权，
         # 防止解除后恢复旧目标、人工下降或外部标定命令。
+        self._fault_active_before_emergency_stop = self.state is ControllerState.FAULT
         self.emergency_stop_reason = reason
         self._target_mm = None
         self._manual_lower = False
@@ -232,10 +235,11 @@ class HeightController:
         self.state = ControllerState.EMERGENCY_STOP
 
     def exit_emergency_stop(self) -> None:
-        """解除急停并回到监控态；被撤销的运动意图不会恢复。"""
+        """解除急停并恢复被覆盖的普通故障；被撤销的运动意图不会恢复。"""
         if self.state is not ControllerState.EMERGENCY_STOP:
             return
 
+        restore_fault = self._fault_active_before_emergency_stop
         self.emergency_stop_reason = None
         self._target_mm = None
         self._manual_lower = False
@@ -243,8 +247,11 @@ class HeightController:
         self._reset_terminal_pulse()
         self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
         self._fault_clear_requested = False
+        # 急停期间不执行周期校验；解除后必须从首个新周期重新建立时序基线。
+        self._last_step_at = None
         self._record_actual_command(PumpCommand.safe_stop())
-        self.state = ControllerState.MONITOR
+        self._fault_active_before_emergency_stop = False
+        self.state = ControllerState.FAULT if restore_fault else ControllerState.MONITOR
 
     def enter_external_mode(self, mode: ControllerState) -> None:
         """进入由独立标定/测量会话拥有命令源的外部安全模式。"""

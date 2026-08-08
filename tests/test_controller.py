@@ -686,6 +686,46 @@ def test_exit_emergency_stop_never_restores_old_target_or_manual_lower() -> None
     assert manual_controller.state is ControllerState.MONITOR
 
 
+def test_exit_emergency_stop_restores_preexisting_fault_until_explicit_clear() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(300.0)
+    fault_command = controller.step(
+        now=0.0,
+        sample=sample(0.0, 100.0, valid=False),
+        feedback=feedback(0.0),
+        lift_authorized=True,
+        lower_authorized=False,
+    )
+    assert fault_command == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.FAULT
+
+    controller.enter_emergency_stop("故障期间触发急停")
+    controller.exit_emergency_stop()
+
+    assert controller.state is ControllerState.FAULT
+    assert controller.target_mm is None
+    assert step(controller, 0.05, 100.0) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.FAULT
+
+    controller.clear_fault()
+    assert step(controller, 0.1, 100.0) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.MONITOR
+
+
+def test_exit_emergency_stop_resets_control_cycle_timeout_baseline() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(300.0)
+    assert step(controller, 0.0, 100.0).lift_pwm == 70
+
+    controller.enter_emergency_stop("长时间急停")
+    controller.exit_emergency_stop()
+    first_cycle = step(controller, 10.0, 100.0)
+
+    assert first_cycle == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.MONITOR
+    assert controller.fault_reason is None
+
+
 @pytest.mark.parametrize(
     "mode",
     [
