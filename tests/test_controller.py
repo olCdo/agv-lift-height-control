@@ -584,6 +584,91 @@ def test_direction_fault_clear_requires_500ms_stable_observation_and_zero_clear_
     assert step(controller, 0.75, 97.8).lift_pwm == 70
 
 
+def test_controller_state_defines_emergency_stop() -> None:
+    assert ControllerState.EMERGENCY_STOP.value == "emergency_stop"
+
+
+@pytest.mark.parametrize("reason", [None, 123, "", "   "])
+def test_emergency_stop_reason_must_be_a_nonblank_string(reason: object) -> None:
+    controller = HeightController(control_config(), calibration())
+
+    with pytest.raises((TypeError, ValueError)):
+        controller.enter_emergency_stop(reason)  # type: ignore[arg-type]
+
+
+def test_emergency_stop_cancels_target_and_blocks_all_normal_motion_requests() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(300.0)
+    assert step(controller, 0.0, 100.0).lift_pwm == 70
+
+    controller.enter_emergency_stop("急停按钮按下")
+
+    assert controller.state is ControllerState.EMERGENCY_STOP
+    assert controller.emergency_stop_reason == "急停按钮按下"
+    assert controller.target_mm is None
+    assert step(controller, 0.05, 100.0) == PumpCommand.safe_stop()
+    with pytest.raises(RuntimeError, match="急停"):
+        controller.set_target(200.0)
+    with pytest.raises(RuntimeError, match="急停"):
+        controller.set_manual_lower(True)
+    with pytest.raises(RuntimeError, match="急停"):
+        controller.enter_external_mode(ControllerState.SURVEY)
+
+    controller.enter_emergency_stop("后续原因不得覆盖首次原因")
+    controller.cancel()
+    controller.clear_fault()
+    assert controller.emergency_stop_reason == "急停按钮按下"
+    assert step(controller, 0.1, 100.0) == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.EMERGENCY_STOP
+
+
+def test_emergency_stop_overrides_external_mode_before_any_input_validation() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.enter_external_mode(ControllerState.SURVEY)
+    controller.enter_emergency_stop("外部急停输入")
+
+    command = controller.step_external(
+        now=math.nan,
+        sample=None,  # type: ignore[arg-type]
+        feedback="bad feedback",  # type: ignore[arg-type]
+        desired_command=object(),  # type: ignore[arg-type]
+        lift_authorized="yes",  # type: ignore[arg-type]
+        lower_authorized=None,  # type: ignore[arg-type]
+    )
+
+    assert command == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.EMERGENCY_STOP
+    assert controller.emergency_stop_reason == "外部急停输入"
+
+
+def test_exit_emergency_stop_never_restores_old_target_or_manual_lower() -> None:
+    target_controller = HeightController(control_config(), calibration())
+    target_controller.set_target(110.0)
+    assert step(target_controller, 0.0, 100.0) == PumpCommand.safe_stop()
+    assert target_controller.state is ControllerState.TERMINAL_PULSE
+
+    target_controller.enter_emergency_stop("现场复位前急停")
+    target_controller.exit_emergency_stop()
+
+    assert target_controller.state is ControllerState.MONITOR
+    assert target_controller.emergency_stop_reason is None
+    assert target_controller.target_mm is None
+    assert step(target_controller, 0.05, 100.0) == PumpCommand.safe_stop()
+
+    manual_controller = HeightController(control_config(), calibration())
+    manual_controller.set_manual_lower(True)
+    manual_controller.enter_emergency_stop("人工下降时急停")
+    manual_controller.exit_emergency_stop()
+    assert step(
+        manual_controller,
+        0.0,
+        100.0,
+        lower_authorized=True,
+    ) == PumpCommand.safe_stop()
+    manual_controller.exit_emergency_stop()
+    assert manual_controller.state is ControllerState.MONITOR
+
+
 @pytest.mark.parametrize(
     "mode",
     [

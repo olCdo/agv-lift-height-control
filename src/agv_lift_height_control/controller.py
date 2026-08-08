@@ -31,6 +31,7 @@ class ControllerState(str, Enum):
     HOLD = "hold"
     MANUAL_LOWER = "manual_lower"
     SURVEY = "survey"
+    EMERGENCY_STOP = "emergency_stop"
     FAULT = "fault"
 
 
@@ -93,6 +94,7 @@ class HeightController:
         )
 
         self.state = ControllerState.MONITOR
+        self.emergency_stop_reason: str | None = None
         self.fault_reason: str | None = None
         self.fault_kind: str | None = None
         self.fault_height_mm: float | None = None
@@ -133,6 +135,8 @@ class HeightController:
         temporary_max_height_mm: float | None = None,
     ) -> None:
         """设置自动起升目标；无持久软限位时强制提供人工临时上限。"""
+        if self.state is ControllerState.EMERGENCY_STOP:
+            raise RuntimeError("急停状态中禁止设置自动目标")
         if self._external_mode is not None:
             raise RuntimeError("外部模式中禁止设置自动目标")
         target = self._validate_height_argument("target_mm", target_mm)
@@ -169,12 +173,15 @@ class HeightController:
         self._record_actual_command(PumpCommand.safe_stop())
         if (
             self.state is not ControllerState.FAULT
+            and self.state is not ControllerState.EMERGENCY_STOP
             and self.state not in EXTERNAL_CONTROLLER_STATES
         ):
             self.state = ControllerState.MONITOR
 
     def set_manual_lower(self, active: bool) -> None:
         """设置人工下降意图；使能时取消自动目标，实际阀输出仍由 step 授权门控。"""
+        if self.state is ControllerState.EMERGENCY_STOP:
+            raise RuntimeError("急停状态中禁止设置人工下降")
         if type(active) is not bool:
             raise TypeError("active 必须是 bool")
         if self._external_mode is not None:
@@ -191,6 +198,9 @@ class HeightController:
 
     def clear_fault(self) -> None:
         """请求清故障；只有下一次 step 的所有门禁恢复后才真正退出 FAULT。"""
+        if self.state is ControllerState.EMERGENCY_STOP:
+            # 普通故障复位不能解除急停，也不能留下会自动清除后续故障的请求。
+            return
         self._fault_clear_requested = True
         if self.state is ControllerState.FAULT and self.fault_kind in {
             "direction",
@@ -199,8 +209,47 @@ class HeightController:
             self._direction_recovery_reference_mm = self.fault_height_mm
             self._direction_recovery_since = None
 
+    def enter_emergency_stop(self, reason: str) -> None:
+        """锁存急停首因，撤销全部运动意图并立即记录安全停机。"""
+        if not isinstance(reason, str):
+            raise TypeError("急停原因必须是 str")
+        if not reason.strip():
+            raise ValueError("急停原因不得为空白")
+        if self.state is ControllerState.EMERGENCY_STOP:
+            return
+
+        # 急停是独立于普通故障的最高优先级状态；切入时必须同时撤销命令源所有权，
+        # 防止解除后恢复旧目标、人工下降或外部标定命令。
+        self.emergency_stop_reason = reason
+        self._target_mm = None
+        self._manual_lower = False
+        self._external_mode = None
+        self._stable_since = None
+        self._reset_terminal_pulse()
+        self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
+        self._fault_clear_requested = False
+        self._record_actual_command(PumpCommand.safe_stop())
+        self.state = ControllerState.EMERGENCY_STOP
+
+    def exit_emergency_stop(self) -> None:
+        """解除急停并回到监控态；被撤销的运动意图不会恢复。"""
+        if self.state is not ControllerState.EMERGENCY_STOP:
+            return
+
+        self.emergency_stop_reason = None
+        self._target_mm = None
+        self._manual_lower = False
+        self._stable_since = None
+        self._reset_terminal_pulse()
+        self._effective_upper_limit_mm = self.calibration.soft_upper_limit_mm
+        self._fault_clear_requested = False
+        self._record_actual_command(PumpCommand.safe_stop())
+        self.state = ControllerState.MONITOR
+
     def enter_external_mode(self, mode: ControllerState) -> None:
         """进入由独立标定/测量会话拥有命令源的外部安全模式。"""
+        if self.state is ControllerState.EMERGENCY_STOP:
+            raise RuntimeError("急停状态中禁止进入外部模式")
         if not isinstance(mode, ControllerState) or mode not in EXTERNAL_CONTROLLER_STATES:
             raise ValueError("外部模式只能是起升标定、下降标定或上限测量")
         if self.state is ControllerState.FAULT:
@@ -239,6 +288,9 @@ class HeightController:
         lower_authorized: bool,
     ) -> PumpCommand:
         """执行一个控制周期，并返回经过全部失效保护后的实际命令。"""
+        # 急停优先于时间、传感器、反馈和授权校验，任何坏输入都不能把状态改写为 FAULT。
+        if self.state is ControllerState.EMERGENCY_STOP:
+            return PumpCommand.safe_stop()
         safe_stop = PumpCommand.safe_stop()
         cycle = self._begin_safety_cycle(
             now=now,
@@ -304,6 +356,9 @@ class HeightController:
         lower_authorized: bool,
     ) -> PumpCommand:
         """仲裁标定或测量会话的期望命令，并返回唯一可下发的实际命令。"""
+        # 急停入口已撤销外部模式；仍须先于模式和命令校验返回全零，保持急停锁存。
+        if self.state is ControllerState.EMERGENCY_STOP:
+            return PumpCommand.safe_stop()
         if self._external_mode is None:
             raise RuntimeError("step_external 只能在外部模式中使用")
         if not isinstance(desired_command, PumpCommand):
