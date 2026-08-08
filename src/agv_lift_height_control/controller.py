@@ -10,7 +10,12 @@ from __future__ import annotations
 from enum import Enum
 from math import isfinite
 
-from .calibration import LIFT_PWM_LEVELS, LOWER_VALVE_LEVELS, CalibrationBundle
+from .calibration import (
+    LIFT_PULSE_S,
+    LIFT_PWM_LEVELS,
+    LOWER_VALVE_LEVELS,
+    CalibrationBundle,
+)
 from .config import ControlConfig
 from .types import HeightSample, PumpCommand, PumpFeedback
 
@@ -77,7 +82,9 @@ class HeightController:
         # 极端或未来 schema 数据退化时仍保留非空 P 区，禁止除零和区间反转。
         if self.slow_zone_mm <= self.pulse_zone_mm:
             self.slow_zone_mm = self.pulse_zone_mm + 1.0
-        self.pulse_on_s = min(max(calibration.response_delay_s, 0.1), 0.3)
+        # 响应延迟只决定停泵后需观察多久，不能当作通泵时长；否则延迟越大，
+        # 实际注入的液压能量反而越多。末端动作必须复用已现场验证的100 ms标定脉冲。
+        self.pulse_on_s = LIFT_PULSE_S
         self.pulse_wait_s = min(
             max(calibration.response_delay_s + config.stable_time_s, 0.3), 1.0
         )

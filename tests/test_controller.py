@@ -13,6 +13,7 @@ from agv_lift_height_control import (
     PumpFeedback,
     UpperLimitSurvey,
 )
+from agv_lift_height_control.calibration import LIFT_PULSE_S
 
 
 def control_config(**changes: float) -> ControlConfig:
@@ -153,20 +154,19 @@ def test_terminal_pulse_settles_before_first_on_and_waits_after_each_pulse() -> 
     controller = HeightController(control_config(), calibration())
     controller.set_target(110.0)
 
-    assert controller.pulse_on_s == pytest.approx(0.15)
+    assert controller.pulse_on_s == pytest.approx(LIFT_PULSE_S)
     assert controller.pulse_wait_s == pytest.approx(0.65)
     for index in range(13):
         assert step(controller, index / 20, 100.0) == PumpCommand.safe_stop()
     assert step(controller, 0.64, 100.0) == PumpCommand.safe_stop()
     assert step(controller, 0.65, 100.0).lift_pwm == 50
     assert step(controller, 0.70, 100.0).lift_pwm == 50
-    assert step(controller, 0.75, 100.0).lift_pwm == 50
-    assert step(controller, 0.79, 100.0).lift_pwm == 50
-    assert step(controller, 0.80, 100.0) == PumpCommand.safe_stop()
+    assert step(controller, 0.74, 100.0).lift_pwm == 50
+    assert step(controller, 0.75, 100.0) == PumpCommand.safe_stop()
     for index in range(12):
-        assert step(controller, 0.85 + index / 20, 100.0) == PumpCommand.safe_stop()
-    assert step(controller, 1.44, 100.0) == PumpCommand.safe_stop()
-    assert step(controller, 1.45, 100.0).lift_pwm == 50
+        assert step(controller, 0.80 + index / 20, 100.0) == PumpCommand.safe_stop()
+    assert step(controller, 1.39, 100.0) == PumpCommand.safe_stop()
+    assert step(controller, 1.40, 100.0).lift_pwm == 50
 
 
 def test_terminal_authorization_loss_restarts_with_full_settle() -> None:
