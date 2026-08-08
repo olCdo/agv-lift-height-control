@@ -129,9 +129,18 @@ class LiftHeightControl:
                 raise RuntimeError("控制器已有普通故障，禁止通过急停解除绕过")
 
             # latch.clear 还会原子核验本次急停后的全零成功发送证据及传输恢复状态。
-            # 只有最底层发送门禁确认解除后，控制器才能退出急停。
-            self.emergency_stop_latch.clear()
-            self.controller.exit_emergency_stop()
+            # guard 与 trigger、发送门禁共用底层锁，使“锁存解除 + 控制器退出”成为
+            # 一个复合状态转换；新一轮急停只能在两者全部完成后开始。
+            with self.emergency_stop_latch.state_transition_guard():
+                current = self.emergency_stop_latch.snapshot()
+                if (
+                    not current.active
+                    or current.reason != emergency.reason
+                    or current.triggered_at != emergency.triggered_at
+                ):
+                    raise RuntimeError("急停锁存状态已变化，禁止继续解除")
+                self.emergency_stop_latch.clear()
+                self.controller.exit_emergency_stop()
 
     def _validated_now(self) -> float:
         value = self._clock()

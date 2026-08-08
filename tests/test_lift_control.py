@@ -142,41 +142,59 @@ def test_clear_synchronizes_a_pump_side_latch_before_releasing_it() -> None:
     assert control.update(1.0, _sample(1.0), _feedback(1.0)) == PumpCommand.safe_stop()
 
 
-def test_emergency_stop_retriggers_if_clear_wins_before_facade_lock() -> None:
+def test_trigger_waits_until_clear_and_controller_exit_finish_as_one_transition() -> None:
     now = [1.0]
     control, controller, latch = _control(now)
-    triggered = threading.Event()
-    original_trigger = latch.trigger
+    control.emergency_stop("旧一轮急停")
+    control.update(1.0, _sample(1.0), _feedback(1.0))
+    latch.record_send_success(PumpCommand.safe_stop())
+    exit_entered = threading.Event()
+    allow_exit = threading.Event()
+    trigger_finished = threading.Event()
+    errors: list[BaseException] = []
+    original_exit = controller.exit_emergency_stop
 
-    def observed_trigger(reason: str) -> None:
-        original_trigger(reason)
-        triggered.set()
+    def blocking_exit() -> None:
+        exit_entered.set()
+        if not allow_exit.wait(timeout=1.0):
+            raise RuntimeError("测试未允许控制器退出急停")
+        original_exit()
 
-    latch.trigger = observed_trigger  # type: ignore[method-assign]
-    errors = []
+    controller.exit_emergency_stop = blocking_exit  # type: ignore[method-assign]
 
-    def stop_from_other_thread() -> None:
+    def clear_from_other_thread() -> None:
         try:
-            control.emergency_stop("并发急停")
+            control.clear_emergency_stop()
         except BaseException as exc:
             errors.append(exc)
 
-    control._lock.acquire()
-    worker = threading.Thread(target=stop_from_other_thread)
-    try:
-        worker.start()
-        assert triggered.wait(timeout=1.0)
-        latch.record_send_success(PumpCommand.safe_stop())
-        latch.clear()
-    finally:
-        control._lock.release()
-    worker.join(timeout=1.0)
+    def trigger_new_stop() -> None:
+        latch.trigger("新一轮急停")
+        trigger_finished.set()
+
+    clear_worker = threading.Thread(target=clear_from_other_thread)
+    trigger_worker = threading.Thread(target=trigger_new_stop)
+    clear_worker.start()
+    assert exit_entered.wait(timeout=1.0)
+    trigger_worker.start()
+
+    # 旧 clear 的控制器退出仍在进行，新 trigger 不得穿过同一状态转换原子段。
+    assert trigger_finished.wait(timeout=0.05) is False
+    allow_exit.set()
+    clear_worker.join(timeout=1.0)
+    trigger_worker.join(timeout=1.0)
 
     assert errors == []
-    assert worker.is_alive() is False
+    assert clear_worker.is_alive() is False
+    assert trigger_worker.is_alive() is False
+    assert trigger_finished.is_set()
     assert latch.snapshot().active is True
-    assert latch.snapshot().reason == "并发急停"
+    assert latch.snapshot().reason == "新一轮急停"
+    assert controller.state is ControllerState.MONITOR
+
+    assert control.update(1.0, _sample(1.0), _feedback(1.0)) == PumpCommand.safe_stop()
     assert controller.state is ControllerState.EMERGENCY_STOP
+    assert controller.emergency_stop_reason == "新一轮急停"
 
 
 @pytest.mark.parametrize(

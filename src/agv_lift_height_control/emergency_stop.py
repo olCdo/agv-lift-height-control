@@ -71,6 +71,15 @@ class EmergencyStopLatch:
             )
 
     @contextmanager
+    def state_transition_guard(self) -> Iterator[None]:
+        """串行化涉及锁存状态与外部控制状态的复合转换。"""
+        # clear 本身只能保护锁存字段；门面还需在解除锁存后退出控制器急停。
+        # 对外提供有语义的守卫，使 trigger、clear 与发送门禁共用本锁，避免
+        # 新一轮 trigger 插入“旧锁存已清、旧控制器尚未退出”的两步转换之间。
+        with self._lock:
+            yield
+
+    @contextmanager
     def gate_command_for_send(
         self,
         command: PumpCommand,
