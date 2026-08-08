@@ -26,6 +26,9 @@ def valid_control_config() -> dict[str, object]:
         "direction_tolerance_mm": 1.0,
         "survey_max_on_s": 1.0,
         "survey_pause_s": 0.5,
+        "lower_terminal_zone_mm": 10.0,
+        "lower_pulse_on_s": 0.05,
+        "lower_pulse_wait_s": 0.70,
     }
 
 
@@ -131,6 +134,40 @@ def test_load_config_returns_strict_typed_control_settings(tmp_path) -> None:
     assert isinstance(config.control, ControlConfig)
     assert config.control.tolerance_mm == 2.0
     assert config.control.absolute_max_height_mm == 2900.0
+
+
+def test_load_legacy_control_config_uses_lowering_defaults(tmp_path) -> None:
+    data = valid_config()
+    control = data["control"]
+    assert isinstance(control, dict)
+    control.pop("lower_terminal_zone_mm")
+    control.pop("lower_pulse_on_s")
+    control.pop("lower_pulse_wait_s")
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.control.lower_terminal_zone_mm == 10.0
+    assert config.control.lower_pulse_on_s == 0.05
+    assert config.control.lower_pulse_wait_s == 0.70
+
+
+def test_load_control_config_uses_explicit_lowering_values(tmp_path) -> None:
+    data = valid_config()
+    control = data["control"]
+    assert isinstance(control, dict)
+    control.update(
+        {
+            "lower_terminal_zone_mm": 20.0,
+            "lower_pulse_on_s": 0.10,
+            "lower_pulse_wait_s": 0.90,
+        }
+    )
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.control.lower_terminal_zone_mm == 20.0
+    assert config.control.lower_pulse_on_s == 0.10
+    assert config.control.lower_pulse_wait_s == 0.90
 
 
 def test_example_config_declares_safe_control_defaults() -> None:
@@ -279,6 +316,12 @@ def test_can_config_rejects_invalid_direct_construction(field: str, value: objec
         ("current_duration_s", 0.2001),
         ("direction_tolerance_mm", 2.001),
         ("survey_max_on_s", 1.001),
+        ("lower_terminal_zone_mm", 2.0),
+        ("lower_terminal_zone_mm", 50.001),
+        ("lower_pulse_on_s", 0.049),
+        ("lower_pulse_on_s", 0.151),
+        ("lower_pulse_wait_s", 0.299),
+        ("lower_pulse_wait_s", 1.001),
     ],
 )
 def test_control_config_rejects_invalid_direct_construction(

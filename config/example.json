@@ -41,7 +41,10 @@
     "current_duration_s": 0.2,
     "direction_tolerance_mm": 1.0,
     "survey_max_on_s": 1.0,
-    "survey_pause_s": 0.5
+    "survey_pause_s": 0.5,
+    "lower_terminal_zone_mm": 10.0,
+    "lower_pulse_on_s": 0.05,
+    "lower_pulse_wait_s": 0.70
   },
   "storage": {
     "state_dir": "~/.local/state/agv-lift-height-control",

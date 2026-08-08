@@ -117,6 +117,9 @@ class ControlConfig:
     direction_tolerance_mm: float
     survey_max_on_s: float
     survey_pause_s: float
+    lower_terminal_zone_mm: float = 10.0
+    lower_pulse_on_s: float = 0.05
+    lower_pulse_wait_s: float = 0.70
 
     def __post_init__(self) -> None:
         for name in (
@@ -161,6 +164,27 @@ class ControlConfig:
             raise ConfigError("control.current_multiplier 必须大于 1 且不超过 1.5")
         if self.tolerance_mm >= self.overshoot_limit_mm:
             raise ConfigError("control.tolerance_mm 必须小于 overshoot_limit_mm")
+        _validate_number_range(
+            "lower_terminal_zone_mm",
+            self.lower_terminal_zone_mm,
+            self.tolerance_mm + 0.001,
+            50.0,
+            section="control",
+        )
+        _validate_number_range(
+            "lower_pulse_on_s",
+            self.lower_pulse_on_s,
+            0.05,
+            0.15,
+            section="control",
+        )
+        _validate_number_range(
+            "lower_pulse_wait_s",
+            self.lower_pulse_wait_s,
+            0.3,
+            1.0,
+            section="control",
+        )
 
 
 @dataclass(frozen=True)
@@ -290,9 +314,13 @@ def _parse_can(data: dict[str, Any]) -> CanConfig:
 def _parse_control(data: dict[str, Any]) -> ControlConfig:
     """逐字段解析控制阈值，禁止拼写错误被静默忽略。"""
     _reject_unknown_fields(data, CONTROL_FIELDS, "control 配置")
+    values = dict(data)
+    values.setdefault("lower_terminal_zone_mm", 10.0)
+    values.setdefault("lower_pulse_on_s", 0.05)
+    values.setdefault("lower_pulse_wait_s", 0.70)
     return ControlConfig(
         **{
-            name: _number(data, name, positive=True, section="control")
+            name: _number(values, name, positive=True, section="control")
             for name in CONTROL_FIELDS
         }
     )
