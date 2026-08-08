@@ -41,6 +41,7 @@ from .config import (
     load_config,
 )
 from .controller import ControllerState, HeightController
+from .emergency_stop import EmergencyStopLatch, EmergencyStopSnapshot
 from .modbus_rtu import ModbusRtuHeightSource
 from .operator_runtime import (
     CsvEventLogger,
@@ -82,6 +83,8 @@ __all__ = [
     "ControllerState",
     "CsvEventLogger",
     "DeadmanAuthorizer",
+    "EmergencyStopLatch",
+    "EmergencyStopSnapshot",
     "ForegroundRuntime",
     "HeightSample",
     "HeightController",
