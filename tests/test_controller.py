@@ -188,10 +188,34 @@ def test_target_requires_500ms_continuous_tolerance_before_hold() -> None:
     controller.set_target(100.0)
 
     for now in (0.0, 0.1, 0.2, 0.3, 0.4):
-        assert step(controller, now, 99.0).lift_pwm == 0
+        command = step(controller, now, 99.0, lift_authorized=False)
+        assert command == PumpCommand.hydraulic_hold()
         assert controller.state is not ControllerState.HOLD
-    assert step(controller, 0.5, 99.0).lift_pwm == 0
+    assert (
+        step(controller, 0.5, 99.0, lift_authorized=False)
+        == PumpCommand.hydraulic_hold()
+    )
     assert controller.state is ControllerState.HOLD
+
+
+def test_hydraulic_hold_fails_to_all_zero_on_sensor_fault() -> None:
+    controller = HeightController(control_config(), calibration())
+    controller.set_target(100.0)
+    assert (
+        step(controller, 0.0, 99.0, lift_authorized=False)
+        == PumpCommand.hydraulic_hold()
+    )
+
+    command = controller.step(
+        now=0.1,
+        sample=HeightSample(0.1, 100, 99.0, False, "sensor error"),
+        feedback=feedback(0.1),
+        lift_authorized=False,
+        lower_authorized=False,
+    )
+
+    assert command == PumpCommand.safe_stop()
+    assert controller.state is ControllerState.FAULT
 
 
 def test_overshoot_never_auto_lowers_and_faults_only_beyond_limit() -> None:
@@ -200,6 +224,7 @@ def test_overshoot_never_auto_lowers_and_faults_only_beyond_limit() -> None:
 
     command = step(controller, 0.0, 103.0)
     assert command.lift_pwm == command.lower_valve == 0
+    assert command.interlock is False
     assert controller.state is ControllerState.IDLE
     assert controller.trial_failed
     assert controller.fault_reason is None

@@ -1,7 +1,8 @@
 """无硬件依赖的混合闭环高度控制器。
 
 ``step`` 的安全顺序固定为：输入与时序门禁 → 锁存故障处理 → 控制状态机 →
-授权门控。任何门禁失败或授权缺失都返回完整全零；本控制器永不因自动目标而下降。
+授权门控。任何门禁失败都返回完整全零；运动授权缺失时禁止非零动作，但无故障的
+目标稳定窗口允许只启用互锁的液压保持。本控制器永不因自动目标而下降。
 """
 
 from __future__ import annotations
@@ -667,7 +668,7 @@ class HeightController:
                 self.state = ControllerState.HOLD
             else:
                 self.state = ControllerState.IDLE
-            return PumpCommand.safe_stop()
+            return PumpCommand.hydraulic_hold()
 
         self._stable_since = None
         if error > self.slow_zone_mm:
