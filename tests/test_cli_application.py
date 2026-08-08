@@ -17,6 +17,7 @@ def parse(*args):
         ("observe-can",),
         ("zero-can",),
         ("calibrate-lift", "--temporary-max-mm", "1200"),
+        ("prepare-lower", "--target-mm", "100", "--temporary-max-mm", "200"),
         ("calibrate-lower",),
         ("confirm-lower", "--comfortable-valve", "0x50"),
         ("move", "--target-mm", "120", "--temporary-max-mm", "500"),
@@ -58,6 +59,26 @@ def test_survey_requires_temporary_limit() -> None:
 def test_calibrate_lift_requires_temporary_limit() -> None:
     with pytest.raises(SystemExit):
         parse("calibrate-lift")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("prepare-lower",),
+        ("prepare-lower", "--target-mm", "100"),
+        ("prepare-lower", "--temporary-max-mm", "200"),
+        (
+            "prepare-lower",
+            "--target-mm",
+            "nan",
+            "--temporary-max-mm",
+            "200",
+        ),
+    ],
+)
+def test_prepare_lower_requires_finite_target_and_temporary_limit(args) -> None:
+    with pytest.raises(SystemExit):
+        parse(*args)
 
 
 def test_action_commands_reject_unsafe_early_confirmation_flags() -> None:

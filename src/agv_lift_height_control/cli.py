@@ -73,6 +73,19 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         type=_bounded_float("起升标定临时最大高度", 0.001, 2900.0),
     )
+    prepare_lower = subparsers.add_parser(
+        "prepare-lower", help="使用起升草稿为下降标定安全预升"
+    )
+    prepare_lower.add_argument(
+        "--target-mm",
+        required=True,
+        type=_bounded_float("预升目标高度", 0.001, 2900.0),
+    )
+    prepare_lower.add_argument(
+        "--temporary-max-mm",
+        required=True,
+        type=_bounded_float("预升临时最大高度", 0.001, 2900.0),
+    )
     subparsers.add_parser("calibrate-lower", help="读取起升草稿并完成下降动作测量")
     confirm_lower = subparsers.add_parser(
         "confirm-lower", help="不打开硬件，确认已实测舒适下降阀值"
