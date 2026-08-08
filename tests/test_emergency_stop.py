@@ -71,11 +71,23 @@ def test_clear_rejects_active_latch_without_post_trigger_zero_send() -> None:
     assert latch.snapshot().active is True
 
 
-def test_nonzero_command_cannot_prove_post_trigger_zero_send() -> None:
+@pytest.mark.parametrize(
+    "command",
+    [
+        PumpCommand(interlock=True),
+        PumpCommand(lift_pwm=1),
+        PumpCommand(accel=1),
+        PumpCommand(decel=1),
+        PumpCommand(lower_valve=1),
+    ],
+)
+def test_nonzero_command_cannot_prove_post_trigger_zero_send(
+    command: PumpCommand,
+) -> None:
     latch = EmergencyStopLatch()
     latch.trigger("limit switch")
 
-    latch.record_send_success(PumpCommand(interlock=True))
+    latch.record_send_success(command)
 
     assert latch.snapshot().zero_sent_after_trigger is False
     with pytest.raises(RuntimeError, match="全零"):
@@ -105,6 +117,8 @@ def test_transport_updates_are_ignored_while_inactive() -> None:
     latch = EmergencyStopLatch()
 
     latch.record_transport_fault("stale fault")
+    assert latch.snapshot().transport_fault is None
+
     latch.record_transport_recovered()
 
     assert latch.snapshot().transport_fault is None
