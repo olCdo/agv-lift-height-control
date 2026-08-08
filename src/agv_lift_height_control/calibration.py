@@ -337,7 +337,7 @@ class PrepareLowerSession:
         if self.done or self.failed:
             return PumpCommand.safe_stop()
         try:
-            timestamp, height, _checked_feedback = _validate_session_inputs(
+            timestamp, height, checked_feedback = _validate_session_inputs(
                 now=now,
                 sample=sample,
                 feedback=feedback,
@@ -348,8 +348,11 @@ class PrepareLowerSession:
             )
             self._last_now = timestamp
             self.final_height_mm = height
-            if self._initial_height is None:
-                self._initial_height = height
+            self._initialize_start_height(height)
+            # 有效硬上限优先级高于目标完成；跳变到上限不能被记作成功。
+            self._guard_hard_limit(height)
+            self._guard_direction(height)
+            self._guard_overcurrent(timestamp, checked_feedback)
             if self._started_output and height >= self.target_mm:
                 self.state = PrepareLowerState.DONE
                 return PumpCommand.safe_stop()
@@ -399,6 +402,35 @@ class PrepareLowerSession:
         self._settle_started_at = None
         self._cycle_start_height = None
         return self._wait_or_start(now, height, lift_authorized)
+
+    def _initialize_start_height(self, height: float) -> None:
+        if self._initial_height is not None:
+            return
+        self._initial_height = height
+        if self.target_mm <= height:
+            raise CalibrationError("预升目标必须高于启动高度")
+
+    def _guard_hard_limit(self, height: float) -> None:
+        if height >= self.effective_max_height_mm:
+            raise CalibrationError("预升高度达到有效最大高度")
+
+    def _guard_direction(self, height: float) -> None:
+        if (
+            self._cycle_start_height is not None
+            and height < self._cycle_start_height - self._direction_tolerance_mm
+        ):
+            raise CalibrationError("预升期间高度方向反向")
+
+    def _guard_overcurrent(self, now: float, feedback: PumpFeedback) -> None:
+        """按有符号反馈的绝对值累计持续时间，短时尖峰不会误停机。"""
+        if abs(feedback.current_raw) <= self._overcurrent_threshold:
+            self._overcurrent_since = None
+            return
+        if self._overcurrent_since is None:
+            self._overcurrent_since = now
+            return
+        if now - self._overcurrent_since + 1e-12 >= self._current_duration_s:
+            raise CalibrationError("预升泵电流持续过流")
 
     def _fail(self, reason: str) -> PumpCommand:
         self.state = PrepareLowerState.FAULT

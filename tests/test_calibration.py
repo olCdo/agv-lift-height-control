@@ -547,6 +547,94 @@ def test_prepare_lower_requires_room_for_measured_coast() -> None:
         prepare_session(target=198.0, upper=200.0)
 
 
+def test_prepare_lower_rejects_target_not_above_initial_height() -> None:
+    session = prepare_session(target=100.0)
+
+    command = session.step(
+        now=0.0,
+        sample=sample(0.0, 100.0),
+        feedback=feedback(0.0),
+        lift_authorized=False,
+    )
+
+    assert command == PumpCommand.safe_stop()
+    assert session.failed
+    assert "高于启动高度" in (session.fault_reason or "")
+
+
+def test_prepare_lower_latches_reverse_motion() -> None:
+    session = prepare_session()
+    session.step(
+        now=0.0,
+        sample=sample(0.0, 10.0),
+        feedback=feedback(0.0),
+        lift_authorized=True,
+    )
+
+    command = session.step(
+        now=0.04,
+        sample=sample(0.04, 9.4),
+        feedback=feedback(0.04),
+        lift_authorized=True,
+    )
+
+    assert command == PumpCommand.safe_stop()
+    assert session.failed
+    assert "反向" in (session.fault_reason or "")
+
+
+def test_prepare_lower_overcurrent_must_persist_for_configured_duration() -> None:
+    session = prepare_session()
+    threshold_current = 1400
+
+    session.step(
+        now=0.0,
+        sample=sample(0.0, 10.0),
+        feedback=feedback(0.0, threshold_current),
+        lift_authorized=True,
+    )
+    assert not session.failed
+    session.step(
+        now=0.199,
+        sample=sample(0.199, 10.1),
+        feedback=feedback(0.199, -threshold_current),
+        lift_authorized=True,
+    )
+    assert not session.failed
+
+    command = session.step(
+        now=0.2,
+        sample=sample(0.2, 10.1),
+        feedback=feedback(0.2, threshold_current),
+        lift_authorized=True,
+    )
+
+    assert command == PumpCommand.safe_stop()
+    assert session.failed
+    assert "过流" in (session.fault_reason or "")
+
+
+def test_prepare_lower_faults_at_effective_hard_limit_before_success() -> None:
+    session = prepare_session(target=100.0, upper=102.5)
+    session.step(
+        now=0.0,
+        sample=sample(0.0, 10.0),
+        feedback=feedback(0.0),
+        lift_authorized=True,
+    )
+
+    command = session.step(
+        now=0.04,
+        sample=sample(0.04, 102.5),
+        feedback=feedback(0.04),
+        lift_authorized=True,
+    )
+
+    assert command == PumpCommand.safe_stop()
+    assert session.failed
+    assert "有效最大高度" in (session.fault_reason or "")
+
+
 def test_lift_session_expired_sample_latches_failure_during_output() -> None:
     session = LiftCalibrationSession()
     assert session.step(
